@@ -1,0 +1,19 @@
+{
+  "description": "Starts the profile-scoped CodexQuotaTitle integration probe for new and resumed sessions.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$PLUGIN_ROOT/hooks/session-start.sh\"",
+            "commandWindows": "cmd.exe /d /c ${PLUGIN_ROOT}\\hooks\\session-start.cmd",
+            "timeout": 10,
+            "async": false
+          }
+        ]
+      }
+    ]
+  }
+}

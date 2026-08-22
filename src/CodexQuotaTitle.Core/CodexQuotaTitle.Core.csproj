@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>CodexQuotaTitle.Core</AssemblyName>
+    <RootNamespace>CodexQuotaTitle</RootNamespace>
+  </PropertyGroup>
+</Project>

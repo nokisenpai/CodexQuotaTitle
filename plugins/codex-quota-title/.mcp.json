@@ -1,0 +1,10 @@
+{
+  "codex_quota_title": {
+    "command": "./bin/mcp/win-x64/CodexQuotaTitle.Mcp.exe",
+    "args": [],
+    "cwd": ".",
+    "env_vars": [
+      "CODEX_HOME"
+    ]
+  }
+}

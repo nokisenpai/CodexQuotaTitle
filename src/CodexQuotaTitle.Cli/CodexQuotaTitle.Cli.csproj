@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\CodexQuotaTitle.Core\CodexQuotaTitle.Core.csproj" />
+    <ProjectReference Include="..\CodexQuotaTitle.Mcp\CodexQuotaTitle.Mcp.csproj" />
+  </ItemGroup>
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>CodexQuotaTitle</AssemblyName>
+    <RootNamespace>CodexQuotaTitle.Cli</RootNamespace>
+  </PropertyGroup>
+</Project>

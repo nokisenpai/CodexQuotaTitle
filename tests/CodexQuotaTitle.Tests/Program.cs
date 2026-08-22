@@ -1,0 +1,1366 @@
+using CodexQuotaTitle.Quotas;
+using CodexQuotaTitle.Profiles;
+using CodexQuotaTitle.Titles;
+using CodexQuotaTitle.Integration;
+using CodexQuotaTitle.Mcp;
+using CodexQuotaTitle.Accounts;
+using CodexQuotaTitle.Settings;
+using System.Diagnostics;
+using System.Text.Json;
+using CodexQuotaTitle.Windows;
+
+var tests = new (string Name, Action Execute)[]
+{
+    ("Template renders duration-based 5h and week aliases", TemplateRendersDurationAliases),
+    ("Template supports content before base title", TemplateSupportsPrefix),
+    ("Template requires exactly one base title placeholder", TemplateRequiresOneBaseTitle),
+    ("Template preserves unknown placeholders with diagnostics", TemplatePreservesUnknownPlaceholder),
+    ("Template supports primary and secondary placeholders", TemplateSupportsPrimaryAndSecondaryPlaceholders),
+    ("Template renders missing quota values as em dashes", TemplateRendersMissingValuesAsEmDashes),
+    ("Settings create profile defaults atomically", SettingsCreateProfileDefaultsAtomically),
+    ("Settings persist template changes per profile", SettingsPersistTemplateChangesPerProfile),
+    ("Invalid settings JSON keeps the user file intact", SettingsInvalidJsonKeepsUserFile),
+    ("Title ownership removes only owned ranges", TitleOwnershipRemovesOnlyOwnedRanges),
+    ("Title ownership keeps a replacement title as the base", TitleOwnershipAcceptsReplacementTitle),
+    ("Title ownership leaves incomplete markers intact", TitleOwnershipKeepsIncompleteMarker),
+    ("Same CODEX_HOME has the same profile identity", ProfileIdentityMatchesSameHome),
+    ("Windows-equivalent CODEX_HOME paths have the same identity", ProfileIdentityNormalizesWindowsPathCase),
+    ("Different CODEX_HOME values have different identities", ProfileIdentitySeparatesDifferentHomes),
+    ("Profile singleton allows one owner per profile", ProfileSingletonAllowsOneOwner),
+    ("Profile singleton releases after an asynchronous continuation", ProfileSingletonReleasesAcrossThreads),
+    ("Hook input survives launcher-helper serialization", HookInputSurvivesHelperSerialization),
+    ("Bootstrap log records plugin runtime paths", BootstrapLogRecordsPluginRuntimePaths),
+    ("Bootstrap log records missing plugin root", BootstrapLogRecordsMissingPluginRoot),
+    ("Bootstrap log records missing plugin data", BootstrapLogRecordsMissingPluginData),
+    ("Bootstrap log records a missing launcher", BootstrapLogRecordsMissingLauncher),
+    ("Bootstrap log records an early helper failure without secrets", BootstrapLogRecordsEarlyHelperFailure),
+    ("Bootstrap log tolerates an unwritable target", BootstrapLogToleratesUnwritableTarget),
+    ("MCP startup uses explicit CODEX_HOME", McpStartupContextUsesExplicitCodexHome),
+    ("MCP startup resolves the implicit default CODEX_HOME", McpStartupContextResolvesImplicitDefaultCodexHome),
+    ("Explicit and implicit CODEX_HOME values share an identity", McpStartupContextMatchesEquivalentExplicitAndImplicitHomes),
+    ("MCP does not start a helper when the implicit CODEX_HOME is absent", McpStartupContextDoesNotStartHelperWhenImplicitHomeIsAbsent),
+    ("MCP package configuration forwards CODEX_HOME with relative paths", McpPackageConfigurationForwardsCodexHomeRelatively),
+    ("MCP starts one helper per profile and forwards host hints", McpBootstrapperStartsOneHelperPerProfile),
+    ("MCP can start distinct helpers for distinct profiles", McpBootstrapperAllowsDistinctProfiles),
+    ("Helper uses the host PID, CODEX_HOME, and exits with the host", () => McpHelperServiceUsesBootstrapHintsAndHostLifecycle().GetAwaiter().GetResult()),
+    ("Helper refreshes after a quota notification", () => McpHelperRefreshesAfterQuotaNotification().GetAwaiter().GetResult()),
+    ("Helper performs a periodic quota fallback refresh", () => McpHelperPerformsPeriodicQuotaFallback().GetAwaiter().GetResult()),
+    ("MCP stdio server completes the bootstrap handshake and status call", () => McpStdioServerCompletesBootstrapHandshake().GetAwaiter().GetResult()),
+    ("Win32 title round-trip preserves invisible sentinels", Win32TitleRoundTripPreservesSentinels),
+    ("Title write test renders the explicit weekly template", TitleWriteTestRendersWeeklyTemplate),
+    ("Title write test writes and cleans a controlled Win32 window", () => TitleWriteTestWritesAndCleansControlledWin32Window().GetAwaiter().GetResult()),
+    ("Title write test preserves an external base title during cleanup", () => TitleWriteTestPreservesExternalBaseTitle().GetAwaiter().GetResult()),
+    ("Title write test stops when ownership is lost", () => TitleWriteTestStopsWhenOwnershipIsLost().GetAwaiter().GetResult()),
+    ("Title write test rejects invalid and ambiguous targets", () => TitleWriteTestRejectsInvalidAndAmbiguousTargets().GetAwaiter().GetResult()),
+    ("Automatic refresh preserves an external base-title change", AutomaticRefreshPreservesExternalBaseTitle),
+    ("Automatic refresh does not duplicate owned content", AutomaticRefreshDoesNotDuplicateOwnedContent),
+    ("Disabled settings clean only owned content", AutomaticRefreshDisabledCleansOwnedContent),
+    ("Lost ownership prevents destructive cleanup", AutomaticRefreshOwnershipLostPreventsWrite),
+};
+
+var failures = new List<string>();
+foreach (var test in tests)
+{
+    try
+    {
+        test.Execute();
+        Console.WriteLine($"PASS {test.Name}");
+    }
+    catch (Exception exception)
+    {
+        failures.Add($"FAIL {test.Name}: {exception.Message}");
+    }
+}
+
+foreach (var failure in failures)
+{
+    Console.Error.WriteLine(failure);
+}
+
+return failures.Count == 0 ? 0 : 1;
+
+static void TemplateRendersDurationAliases()
+{
+    var fiveHourReset = new DateTimeOffset(2026, 8, 18, 14, 20, 0, TimeSpan.Zero);
+    var weekReset = new DateTimeOffset(2026, 8, 22, 9, 30, 0, TimeSpan.Zero);
+    var quotas = CreateQuotas(
+        new RateLimitWindow(37m, 300, fiveHourReset),
+        new RateLimitWindow(60m, 10080, weekReset));
+    var renderer = new QuotaTemplateRenderer();
+
+    var parts = renderer.RenderParts(
+        "%base_title% | %5h_percent_remaining% • %5h_reset_date% | %week_percent_remaining% • %week_reset_date%",
+        quotas);
+
+    var expected = string.Concat(
+        "Codex - Example Project | 63% • ", fiveHourReset.ToLocalTime().ToString("dd'/'MM HH:mm"),
+        " | 40% • ", weekReset.ToLocalTime().ToString("dd'/'MM HH:mm"));
+    AssertEqual(expected, parts.Render("Codex - Example Project"));
+}
+
+static void TemplateSupportsPrefix()
+{
+    var quotas = CreateQuotas(null, new RateLimitWindow(25m, 10080, null));
+    var parts = new QuotaTemplateRenderer().RenderParts("%week_percent_remaining% • %base_title%", quotas);
+
+    AssertEqual("75% • ", parts.BeforeBaseTitle);
+    AssertEqual(string.Empty, parts.AfterBaseTitle);
+    AssertEqual("75% • Codex", parts.Render("Codex"));
+}
+
+static void TemplateRequiresOneBaseTitle() =>
+    AssertThrows<FormatException>(() => new QuotaTemplateRenderer().RenderParts("%week_percent_remaining%", CreateQuotas(null, null)));
+
+static void TemplatePreservesUnknownPlaceholder()
+{
+    var renderer = new QuotaTemplateRenderer();
+    var validation = renderer.Validate("%base_title% %future_quota%");
+
+    AssertTrue(validation.IsValid, "An unknown placeholder made the template invalid.");
+    AssertEqual("%future_quota%", validation.UnknownPlaceholders.Single());
+    AssertEqual("Codex %future_quota%", renderer.RenderParts("%base_title% %future_quota%", CreateQuotas(null, null)).Render("Codex"));
+}
+
+static void TemplateSupportsPrimaryAndSecondaryPlaceholders()
+{
+    var primaryReset = new DateTimeOffset(2026, 8, 20, 10, 15, 0, TimeSpan.Zero);
+    var secondaryReset = new DateTimeOffset(2026, 8, 21, 11, 30, 0, TimeSpan.Zero);
+    var quotas = CreateQuotas(new RateLimitWindow(37m, 300, primaryReset), new RateLimitWindow(60m, 10080, secondaryReset));
+
+    var rendered = new QuotaTemplateRenderer()
+        .RenderParts("%base_title% P %primary_percent_used%/%primary_percent_remaining% S %secondary_percent_used%/%secondary_percent_remaining%", quotas)
+        .Render("Codex");
+
+    AssertEqual("Codex P 37%/63% S 60%/40%", rendered);
+}
+
+static void TemplateRendersMissingValuesAsEmDashes()
+{
+    var quotas = CreateQuotas(null, new RateLimitWindow(27m, 10080, null));
+    var rendered = new QuotaTemplateRenderer()
+        .RenderParts("%base_title% 5H %5h_percent_remaining% %5h_reset_date% | W %week_percent_remaining% %week_reset_date%", quotas)
+        .Render("Codex");
+
+    AssertEqual("Codex 5H — — | W 73% —", rendered);
+}
+
+static void SettingsCreateProfileDefaultsAtomically()
+{
+    using var fixture = new SettingsFixture();
+    var result = fixture.Store.LoadOrCreate();
+
+    AssertTrue(result.UsedDefaults, "Defaults were not used for a new profile.");
+    AssertEqual(CodexQuotaTitleSettings.DefaultTemplate, result.Settings.Template);
+    AssertTrue(File.Exists(fixture.Store.Paths.SettingsPath), "The default settings file was not created.");
+    AssertTrue(!Directory.EnumerateFiles(fixture.Store.Paths.DirectoryPath, "*.tmp").Any(), "Atomic settings creation left a temporary file.");
+}
+
+static void SettingsPersistTemplateChangesPerProfile()
+{
+    using var fixture = new SettingsFixture();
+    fixture.Store.Save(CodexQuotaTitleSettings.Defaults with { Template = "%week_percent_remaining% | %base_title%", Enabled = false });
+    var loaded = fixture.Store.LoadOrCreate().Settings;
+
+    AssertEqual("%week_percent_remaining% | %base_title%", loaded.Template);
+    AssertTrue(!loaded.Enabled, "The persisted enabled setting changed unexpectedly.");
+}
+
+static void SettingsInvalidJsonKeepsUserFile()
+{
+    using var fixture = new SettingsFixture();
+    Directory.CreateDirectory(fixture.Store.Paths.DirectoryPath);
+    const string invalidJson = "{ invalid settings";
+    File.WriteAllText(fixture.Store.Paths.SettingsPath, invalidJson);
+
+    var result = fixture.Store.LoadOrCreate();
+
+    AssertTrue(result.UsedDefaults, "Invalid JSON did not fall back to defaults.");
+    AssertEqual("settings-json-invalid", result.Error!);
+    AssertEqual(invalidJson, File.ReadAllText(fixture.Store.Paths.SettingsPath));
+}
+
+static void TitleOwnershipRemovesOnlyOwnedRanges()
+{
+    var ownership = new TitleOwnership(new TestSentinels());
+    var transformed = ownership.Apply("Codex - Example Project", "quota: 63% | ", " • 18/08 14:20");
+
+    AssertEqual("[start]quota: 63% | [end]Codex - Example Project[start] • 18/08 14:20[end]", transformed);
+    AssertEqual("External Codex - Example Project added", ownership.GetBaseTitle("External [start]quota: 63% | [end]Codex - Example Project[start] • 18/08 14:20[end] added"));
+}
+
+static void TitleOwnershipAcceptsReplacementTitle()
+{
+    var ownership = new TitleOwnership(new TestSentinels());
+
+    AssertEqual("Codex - Other project", ownership.GetBaseTitle("Codex - Other project"));
+    AssertEqual("[start]quota[end]Codex - Other project", ownership.Apply("Codex - Other project", "quota", string.Empty));
+}
+
+static void TitleOwnershipKeepsIncompleteMarker()
+{
+    var ownership = new TitleOwnership(new TestSentinels());
+
+    AssertEqual("Codex [start]not-complete", ownership.GetBaseTitle("Codex [start]not-complete"));
+}
+
+static void ProfileIdentityMatchesSameHome()
+{
+    var codexHome = Path.Combine(Path.GetTempPath(), "cqt-profile-tests", Guid.NewGuid().ToString("N"));
+    var first = ProfileIdentity.Create(codexHome);
+    var second = ProfileIdentity.Create(codexHome);
+
+    AssertEqual(first.ProfileHash, second.ProfileHash);
+    AssertEqual(first.NormalizedCodexHome, second.NormalizedCodexHome);
+}
+
+static void ProfileIdentityNormalizesWindowsPathCase()
+{
+    var codexHome = Path.Combine(Path.GetTempPath(), "cqt-profile-tests", Guid.NewGuid().ToString("N"));
+    var first = ProfileIdentity.Create(codexHome);
+    var equivalent = ProfileIdentity.Create(string.Concat(codexHome.ToUpperInvariant(), Path.DirectorySeparatorChar));
+
+    AssertEqual(first.ProfileHash, equivalent.ProfileHash);
+}
+
+static void ProfileIdentitySeparatesDifferentHomes()
+{
+    var root = Path.Combine(Path.GetTempPath(), "cqt-profile-tests", Guid.NewGuid().ToString("N"));
+    var first = ProfileIdentity.Create(Path.Combine(root, "first"));
+    var second = ProfileIdentity.Create(Path.Combine(root, "second"));
+
+    AssertTrue(!string.Equals(first.ProfileHash, second.ProfileHash, StringComparison.Ordinal), "Different profiles shared a hash.");
+}
+
+static void ProfileSingletonAllowsOneOwner()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-profile-tests", Guid.NewGuid().ToString("N")));
+    using var first = ProfileSingleton.TryAcquire(profile);
+    using var second = ProfileSingleton.TryAcquire(profile);
+
+    AssertTrue(first.IsOwner, "The first profile singleton acquisition did not own the mutex.");
+    AssertTrue(!second.IsOwner, "A second helper acquired the profile mutex.");
+}
+
+static void ProfileSingletonReleasesAcrossThreads()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-profile-tests", Guid.NewGuid().ToString("N")));
+    var first = ProfileSingleton.TryAcquire(profile);
+    AssertTrue(first.IsOwner, "The first profile singleton acquisition did not own the synchronization object.");
+
+    Task.Run(first.Dispose).GetAwaiter().GetResult();
+    using var second = ProfileSingleton.TryAcquire(profile);
+    AssertTrue(second.IsOwner, "The profile synchronization object was not released after a continuation on another thread.");
+}
+
+static void HookInputSurvivesHelperSerialization()
+{
+    var input = new IntegrationHookInput("session-42", "C:\\workspace", "startup", "gpt-5.6-codex", "default");
+    using var reader = new StringReader(input.SerializeForHelper());
+    var restored = IntegrationHookInput.ReadAsync(reader).GetAwaiter().GetResult();
+
+    AssertEqual(input.SessionId!, restored.SessionId!);
+    AssertEqual(input.CurrentWorkingDirectory!, restored.CurrentWorkingDirectory!);
+    AssertEqual(input.Source!, restored.Source!);
+    AssertEqual(input.Model!, restored.Model!);
+    AssertEqual(input.PermissionMode!, restored.PermissionMode!);
+}
+
+static void BootstrapLogRecordsPluginRuntimePaths()
+{
+    using var fixture = new BootstrapLogFixture();
+    var log = fixture.CreateLog();
+
+    log.TryAppend("SESSION_START_CMD_ENTERED");
+    log.AppendEnvironmentVariable("PLUGIN_ROOT", "C:\\plugins\\codex-quota-title");
+    log.AppendEnvironmentVariable("PLUGIN_DATA", "C:\\plugin-data\\codex-quota-title");
+
+    var contents = fixture.ReadContents();
+    AssertContains(contents, "SESSION_START_CMD_ENTERED");
+    AssertContains(contents, "PLUGIN_ROOT_PRESENT=TRUE PLUGIN_ROOT_VALUE=C:\\plugins\\codex-quota-title");
+    AssertContains(contents, "PLUGIN_DATA_PRESENT=TRUE PLUGIN_DATA_VALUE=C:\\plugin-data\\codex-quota-title");
+}
+
+static void BootstrapLogRecordsMissingPluginRoot()
+{
+    using var fixture = new BootstrapLogFixture();
+    var log = fixture.CreateLog();
+
+    log.AppendEnvironmentVariable("PLUGIN_ROOT", null);
+    log.TryAppend("LAUNCHER_NOT_STARTED_PLUGIN_ROOT_MISSING");
+
+    var contents = fixture.ReadContents();
+    AssertContains(contents, "PLUGIN_ROOT_PRESENT=FALSE");
+    AssertContains(contents, "LAUNCHER_NOT_STARTED_PLUGIN_ROOT_MISSING");
+}
+
+static void BootstrapLogRecordsMissingPluginData()
+{
+    using var fixture = new BootstrapLogFixture();
+    var log = fixture.CreateLog();
+    using var pluginRoot = new EnvironmentVariableScope("PLUGIN_ROOT", "C:\\plugins\\codex-quota-title");
+    using var pluginData = new EnvironmentVariableScope("PLUGIN_DATA", null);
+
+    AssertThrows<InvalidOperationException>(() =>
+        new IntegrationProbeRunner(log)
+            .RunAsync(new IntegrationHookInput("session-42", "C:\\workspace", "startup", "gpt-5.6-codex", "default"))
+            .GetAwaiter()
+            .GetResult());
+
+    var contents = fixture.ReadContents();
+    AssertContains(contents, "HELPER_PLUGIN_RUNTIME_PATHS_REQUESTED");
+    AssertContains(contents, "HELPER_FAILED_STAGE=plugin-runtime-paths EXCEPTION_TYPE=InvalidOperationException");
+}
+
+static void BootstrapLogRecordsMissingLauncher()
+{
+    using var fixture = new BootstrapLogFixture();
+    var log = fixture.CreateLog();
+
+    log.TryAppend("LAUNCHER_NOT_STARTED_EXECUTABLE_MISSING");
+
+    AssertContains(fixture.ReadContents(), "LAUNCHER_NOT_STARTED_EXECUTABLE_MISSING");
+}
+
+static void BootstrapLogRecordsEarlyHelperFailure()
+{
+    using var fixture = new BootstrapLogFixture();
+    var log = fixture.CreateLog();
+
+    log.TryAppend("HELPER_ENTERED");
+    log.AppendException("HELPER_FAILED", new InvalidOperationException("token=not-for-diagnostics"));
+
+    var contents = fixture.ReadContents();
+    AssertContains(contents, "HELPER_ENTERED");
+    AssertContains(contents, "HELPER_FAILED EXCEPTION_TYPE=InvalidOperationException MESSAGE=[REDACTED]");
+    AssertTrue(!contents.Contains("not-for-diagnostics", StringComparison.Ordinal), "The bootstrap log wrote a token-like value.");
+}
+
+static void BootstrapLogToleratesUnwritableTarget()
+{
+    var path = Path.Combine(Path.GetTempPath(), "cqt-bootstrap-tests", Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    File.WriteAllText(path, "not a directory");
+    try
+    {
+        var log = new HookBootstrapLog(path);
+        AssertTrue(!log.TryAppend("SESSION_START_CMD_ENTERED"), "The bootstrap log unexpectedly wrote through a file path.");
+    }
+    finally
+    {
+        File.Delete(path);
+    }
+}
+
+static void McpStartupContextUsesExplicitCodexHome()
+{
+    const string codexHome = "C:\\test\\codex";
+    var startupContext = McpStartupContext.FromResolver(new CodexHomeResolver(
+        () => codexHome,
+        () => "C:\\test",
+        path => string.Equals(path, codexHome, StringComparison.Ordinal)));
+    var expectedIdentity = ProfileIdentity.Create(codexHome);
+
+    AssertTrue(startupContext.CodexHomeObserved, "The MCP startup context did not observe explicit CODEX_HOME.");
+    AssertTrue(startupContext.CodexHomeAvailable, "The explicit CODEX_HOME was not available.");
+    AssertEqual("EXPLICIT", startupContext.CodexHomeSource!);
+    AssertEqual(codexHome, startupContext.CodexHome!);
+    AssertTrue(startupContext.ProfileIdentity is not null, "The MCP startup context did not create a profile identity.");
+    AssertEqual(expectedIdentity.ProfileHash, startupContext.ProfileIdentity!.ProfileHash);
+}
+
+static void McpStartupContextDoesNotStartHelperWhenImplicitHomeIsAbsent()
+{
+    using var fixture = new McpProcessFixture();
+    var startupContext = McpStartupContext.FromResolver(new CodexHomeResolver(
+        static () => null,
+        () => fixture.DirectoryPath,
+        static _ => false));
+    var bootstrapLog = new McpBootstrapLog(Path.Combine(fixture.DirectoryPath, "CodexQuotaTitle"));
+    bootstrapLog.WriteProcessEntered(startupContext, McpProcessTree.Capture(Environment.ProcessId));
+    var liveness = new TestProcessLiveness();
+    var starter = new TestHelperProcessStarter(liveness);
+    var bootstrapper = new McpHelperBootstrapper(bootstrapLog, startupContext, CreateDesktopProcessTree(), starter, liveness);
+    var result = bootstrapper.EnsureHelper();
+
+    AssertTrue(!startupContext.CodexHomeObserved, "The MCP startup context reported missing CODEX_HOME as present.");
+    AssertTrue(!startupContext.CodexHomeAvailable, "The unavailable implicit CODEX_HOME was treated as available.");
+    AssertTrue(startupContext.ProfileIdentity is null, "The MCP startup context invented a profile identity without CODEX_HOME.");
+    AssertTrue(!result.StartedNewHelper && starter.Requests.Count == 0, "The MCP started a helper for an unavailable implicit CODEX_HOME.");
+    var bootstrapContents = File.ReadAllText(fixture.BootstrapLogPath);
+    AssertContains(bootstrapContents, "CODEX_HOME_PRESENT=FALSE");
+    AssertContains(bootstrapContents, "CODEX_HOME_SOURCE=IMPLICIT_DEFAULT");
+    AssertContains(bootstrapContents, "CODEX_HOME_UNAVAILABLE");
+    AssertContains(bootstrapContents, "PROFILE_IDENTITY_UNAVAILABLE");
+    AssertContains(bootstrapContents, "MCP_HELPER_NOT_STARTED_CODEX_HOME_UNAVAILABLE");
+    AssertTrue(!bootstrapContents.Contains("PROFILE_IDENTITY=", StringComparison.Ordinal), "The MCP bootstrap log invented a profile identity for an unavailable CODEX_HOME.");
+}
+
+static void McpStartupContextResolvesImplicitDefaultCodexHome()
+{
+    using var fixture = new McpProcessFixture();
+    var codexHome = Path.Combine(fixture.DirectoryPath, ".codex");
+    Directory.CreateDirectory(codexHome);
+    var startupContext = McpStartupContext.FromResolver(new CodexHomeResolver(
+        static () => null,
+        () => fixture.DirectoryPath,
+        Directory.Exists));
+
+    AssertTrue(!startupContext.CodexHomeObserved, "The implicit CODEX_HOME was incorrectly reported as explicit.");
+    AssertTrue(startupContext.CodexHomeAvailable, "The implicit CODEX_HOME was not available.");
+    AssertEqual("IMPLICIT_DEFAULT", startupContext.CodexHomeSource!);
+    AssertEqual(codexHome, startupContext.CodexHome!);
+    AssertTrue(startupContext.ProfileIdentity is not null, "The MCP startup context did not create an implicit profile identity.");
+}
+
+static void McpStartupContextMatchesEquivalentExplicitAndImplicitHomes()
+{
+    using var fixture = new McpProcessFixture();
+    var codexHome = Path.Combine(fixture.DirectoryPath, ".codex");
+    Directory.CreateDirectory(codexHome);
+    var explicitContext = McpStartupContext.FromResolver(new CodexHomeResolver(
+        () => codexHome,
+        () => fixture.DirectoryPath,
+        Directory.Exists));
+    var implicitContext = McpStartupContext.FromResolver(new CodexHomeResolver(
+        static () => null,
+        () => fixture.DirectoryPath,
+        Directory.Exists));
+
+    AssertTrue(explicitContext.ProfileIdentity is not null && implicitContext.ProfileIdentity is not null, "Equivalent CODEX_HOME values did not produce identities.");
+    AssertEqual(explicitContext.ProfileIdentity!.ProfileHash, implicitContext.ProfileIdentity!.ProfileHash);
+    AssertTrue(explicitContext.ProfileIdentity.IsCodexHomeExplicit, "The explicit identity lost its source information.");
+    AssertTrue(!implicitContext.ProfileIdentity.IsCodexHomeExplicit, "The implicit identity was marked explicit.");
+}
+
+static void McpPackageConfigurationForwardsCodexHomeRelatively()
+{
+    var repositoryRoot = FindRepositoryRoot();
+    var configurationPath = Path.Combine(repositoryRoot, "plugins", "codex-quota-title", ".mcp.json");
+    using var configuration = JsonDocument.Parse(File.ReadAllText(configurationPath));
+    var server = configuration.RootElement.GetProperty("codex_quota_title");
+    var command = server.GetProperty("command").GetString()!;
+
+    AssertEqual("./bin/mcp/win-x64/CodexQuotaTitle.Mcp.exe", command);
+    AssertEqual(".", server.GetProperty("cwd").GetString()!);
+    AssertTrue(!Path.IsPathRooted(command), "The bundled MCP command is absolute.");
+    AssertTrue(!command.Contains("CodexQuotaTitle\\plugins", StringComparison.OrdinalIgnoreCase), "The bundled MCP command contains the development path.");
+
+    var environmentVariables = server.GetProperty("env_vars").EnumerateArray().Select(value => value.GetString()).ToArray();
+    AssertTrue(environmentVariables.Length == 1 && string.Equals(environmentVariables[0], "CODEX_HOME", StringComparison.Ordinal), "The MCP configuration does not forward only CODEX_HOME.");
+}
+
+static void McpBootstrapperStartsOneHelperPerProfile()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-mcp-bootstrap-tests", Guid.NewGuid().ToString("N")));
+    var runtimePaths = HelperRuntimePaths.ForProfile(profile.ProfileHash);
+    try
+    {
+        var liveness = new TestProcessLiveness();
+        var starter = new TestHelperProcessStarter(liveness);
+        var processTree = CreateDesktopProcessTree();
+        var first = new McpHelperBootstrapper(
+            new McpBootstrapLog(runtimePaths.DirectoryPath),
+            new McpStartupContext(profile.RawCodexHome, profile),
+            processTree,
+            starter,
+            liveness);
+        var second = new McpHelperBootstrapper(
+            new McpBootstrapLog(runtimePaths.DirectoryPath),
+            new McpStartupContext(profile.RawCodexHome, profile),
+            processTree,
+            starter,
+            liveness);
+
+        var firstResult = first.EnsureHelper();
+        var secondResult = second.EnsureHelper();
+
+        AssertTrue(firstResult.StartedNewHelper, "The first MCP did not start the profile helper.");
+        AssertTrue(!secondResult.StartedNewHelper, "The second MCP started another helper for the same profile.");
+        AssertTrue(starter.Requests.Count == 1, "More than one helper start was requested for the same profile.");
+        AssertTrue(starter.Requests[0].HostChatGptPid == 333, "HOST_CHATGPT_PID was not forwarded to the helper.");
+        AssertTrue(starter.Requests[0].HostCodexPid == 222, "HOST_CODEX_PID was not forwarded to the helper.");
+        AssertEqual("mcp", starter.Requests[0].Origin);
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static void McpBootstrapperAllowsDistinctProfiles()
+{
+    var firstProfile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-mcp-bootstrap-tests", Guid.NewGuid().ToString("N"), "first"));
+    var secondProfile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-mcp-bootstrap-tests", Guid.NewGuid().ToString("N"), "second"));
+    var firstPaths = HelperRuntimePaths.ForProfile(firstProfile.ProfileHash);
+    var secondPaths = HelperRuntimePaths.ForProfile(secondProfile.ProfileHash);
+    try
+    {
+        var liveness = new TestProcessLiveness();
+        var starter = new TestHelperProcessStarter(liveness);
+        var processTree = CreateDesktopProcessTree();
+
+        var first = new McpHelperBootstrapper(new McpBootstrapLog(firstPaths.DirectoryPath), new McpStartupContext(firstProfile.RawCodexHome, firstProfile), processTree, starter, liveness);
+        var second = new McpHelperBootstrapper(new McpBootstrapLog(secondPaths.DirectoryPath), new McpStartupContext(secondProfile.RawCodexHome, secondProfile), processTree, starter, liveness);
+
+        AssertTrue(first.EnsureHelper().StartedNewHelper, "The first profile helper was not started.");
+        AssertTrue(second.EnsureHelper().StartedNewHelper, "The distinct profile helper was not started.");
+        AssertTrue(starter.Requests.Count == 2, "Distinct profiles did not receive distinct helper starts.");
+        AssertTrue(!string.Equals(starter.Requests[0].Profile.ProfileHash, starter.Requests[1].Profile.ProfileHash, StringComparison.Ordinal), "Distinct profiles shared a helper identity.");
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(firstPaths);
+        DeleteRuntimeDirectory(secondPaths);
+    }
+}
+
+static async Task McpHelperServiceUsesBootstrapHintsAndHostLifecycle()
+{
+    var userProfileDirectory = Path.Combine(Path.GetTempPath(), "cqt-mcp-helper-tests", Guid.NewGuid().ToString("N"));
+    var codexHome = Path.Combine(userProfileDirectory, ".codex");
+    Directory.CreateDirectory(codexHome);
+    var startupContext = McpStartupContext.FromResolver(new CodexHomeResolver(
+        static () => null,
+        () => userProfileDirectory,
+        Directory.Exists));
+    var profile = startupContext.ProfileIdentity ?? throw new InvalidOperationException("The implicit test profile was unavailable.");
+    var runtimePaths = new HelperRuntimePaths(Path.Combine(Path.GetTempPath(), "cqt-mcp-helper-tests", Guid.NewGuid().ToString("N")));
+    try
+    {
+        var appServerFactory = new TestAppServerSessionFactory();
+        var hostLifetime = new TestHostProcessLifetime();
+        var windowProvider = new TestHostWindowProvider();
+        var request = new McpHelperStartupRequest(startupContext.CodexHome!, profile, 333, 222, "mcp", runtimePaths);
+        var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(new LocalAppDataSettingsPathResolver(Path.Combine(runtimePaths.DirectoryPath, "settings")));
+        var service = new McpHelperService(appServerFactory, hostLifetime, windowProvider, settingsFactory, new TestSettingsChangeWatcherFactory());
+
+        var firstHelper = service.RunAsync(request);
+        await appServerFactory.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await windowProvider.Enumerated.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var stateStore = new HelperRuntimeStateStore(runtimePaths);
+        await Task.Delay(100);
+        var runningState = stateStore.TryRead();
+        AssertTrue(runningState is not null && runningState.IsRunning, "The helper did not persist a running state.");
+        AssertEqual(startupContext.CodexHome!, appServerFactory.CodexHomes.Single());
+        AssertTrue(windowProvider.RequestedProcessIds.Single() == 333, "Windows were not filtered with HOST_CHATGPT_PID.");
+        AssertTrue(runningState!.AppServerConnected, "The helper did not report an App Server connection.");
+        AssertTrue(runningState.Quotas.Count == 1, "The helper did not persist normalized quotas.");
+        AssertTrue(runningState.CandidateWindowCount == 2, "The helper did not persist all top-level host windows.");
+        AssertEqual("WINDOW_CORRELATION_UNAMBIGUOUS", runningState.WindowCorrelation);
+        AssertTrue(runningState.Account is not null && runningState.Account.PlanType == "pro", "The helper did not persist the non-sensitive account summary.");
+
+        var secondFactory = new TestAppServerSessionFactory();
+        var secondHelper = await new McpHelperService(secondFactory, new TestHostProcessLifetime(), windowProvider, settingsFactory, new TestSettingsChangeWatcherFactory()).RunAsync(request);
+        AssertTrue(!secondHelper.AcquiredProfileSingleton, "A second helper acquired the same profile singleton.");
+        AssertTrue(secondFactory.CodexHomes.Count == 0, "The second helper contacted App Server despite the existing singleton.");
+
+        hostLifetime.Complete();
+        var finalResult = await firstHelper.WaitAsync(TimeSpan.FromSeconds(5));
+        AssertTrue(finalResult.AcquiredProfileSingleton, "The primary helper did not own the profile singleton.");
+        var stoppedState = stateStore.TryRead();
+        AssertTrue(stoppedState is not null && !stoppedState.IsRunning, "The helper did not stop after HOST_CHATGPT_PID exited.");
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static async Task McpHelperRefreshesAfterQuotaNotification()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-notification-tests", Guid.NewGuid().ToString("N")));
+    var runtimePaths = new HelperRuntimePaths(Path.Combine(Path.GetTempPath(), "cqt-notification-tests", Guid.NewGuid().ToString("N")));
+    try
+    {
+        var factory = new TestAppServerSessionFactory();
+        var hostLifetime = new TestHostProcessLifetime();
+        var titleUpdater = new TestAutomaticTitleUpdateService();
+        var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(new LocalAppDataSettingsPathResolver(Path.Combine(runtimePaths.DirectoryPath, "settings")));
+        var service = new McpHelperService(factory, hostLifetime, new TestHostWindowProvider(), settingsFactory, new TestSettingsChangeWatcherFactory(), titleUpdater, refreshInterval: TimeSpan.FromMinutes(1));
+        var run = service.RunAsync(new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths));
+        await factory.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        factory.Session.PublishQuota(new QuotaSnapshot("codex", "Codex", new RateLimitWindow(55m, 300, DateTimeOffset.UtcNow.AddHours(1)), null));
+        await WaitUntilAsync(() => titleUpdater.Requests.Count >= 2, TimeSpan.FromSeconds(2));
+        var state = new HelperRuntimeStateStore(runtimePaths).TryRead();
+        AssertTrue(state is not null && state.Quotas.Single().Primary?.UsedPercent == 55m, "The quota notification did not update normalized helper state.");
+
+        hostLifetime.Complete();
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static async Task McpHelperPerformsPeriodicQuotaFallback()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-periodic-tests", Guid.NewGuid().ToString("N")));
+    var runtimePaths = new HelperRuntimePaths(Path.Combine(Path.GetTempPath(), "cqt-periodic-tests", Guid.NewGuid().ToString("N")));
+    try
+    {
+        var factory = new TestAppServerSessionFactory();
+        var hostLifetime = new TestHostProcessLifetime();
+        var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(new LocalAppDataSettingsPathResolver(Path.Combine(runtimePaths.DirectoryPath, "settings")));
+        var service = new McpHelperService(factory, hostLifetime, new TestHostWindowProvider(), settingsFactory, new TestSettingsChangeWatcherFactory(), new TestAutomaticTitleUpdateService(), refreshInterval: TimeSpan.FromMilliseconds(20));
+        var run = service.RunAsync(new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths));
+        await factory.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => factory.Session.ReadRateLimitsCallCount >= 2, TimeSpan.FromSeconds(2));
+        AssertTrue(factory.Session.ReadRateLimitsCallCount >= 2, "The periodic fallback did not read rate limits again.");
+
+        hostLifetime.Complete();
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static McpProcessTree CreateDesktopProcessTree() =>
+    new(
+        222,
+        [
+            new McpProcessNode(111, "CodexQuotaTitle.Mcp.exe"),
+            new McpProcessNode(222, "codex.exe"),
+            new McpProcessNode(333, "ChatGPT.exe"),
+        ]);
+
+static void DeleteRuntimeDirectory(HelperRuntimePaths runtimePaths)
+{
+    if (Directory.Exists(runtimePaths.DirectoryPath))
+    {
+        Directory.Delete(runtimePaths.DirectoryPath, recursive: true);
+    }
+}
+
+static async Task McpStdioServerCompletesBootstrapHandshake()
+{
+    using var fixture = new McpProcessFixture();
+    var codexHome = Path.Combine(fixture.DirectoryPath, "codex-home");
+    Directory.CreateDirectory(codexHome);
+    var packagePath = Path.Combine(FindRepositoryRoot(), "plugins", "codex-quota-title", "bin", "mcp", "win-x64", "CodexQuotaTitle.Mcp.exe");
+    AssertTrue(File.Exists(packagePath), "The self-contained MCP executable was not published to the plugin package.");
+
+    var startInfo = new ProcessStartInfo
+    {
+        FileName = packagePath,
+        UseShellExecute = false,
+        RedirectStandardInput = true,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        WorkingDirectory = fixture.DirectoryPath,
+    };
+    startInfo.Environment["TEMP"] = fixture.DirectoryPath;
+    startInfo.Environment["TMP"] = fixture.DirectoryPath;
+    startInfo.Environment["LOCALAPPDATA"] = fixture.DirectoryPath;
+    startInfo.Environment["CODEXQUOTATITLE_SETTINGS_ROOT"] = fixture.DirectoryPath;
+    startInfo.Environment["CODEX_HOME"] = codexHome;
+    startInfo.Environment.Remove("PLUGIN_ROOT");
+    startInfo.Environment.Remove("PLUGIN_DATA");
+
+    using var process = Process.Start(startInfo) ?? throw new InvalidOperationException("The MCP server process did not start.");
+    await WriteJsonAsync(process, """{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}""");
+    using (var initializeResponse = await ReadResponseAsync(process))
+    {
+        AssertEqual("2025-03-26", initializeResponse.RootElement.GetProperty("result").GetProperty("protocolVersion").GetString()!);
+    }
+
+    await WriteJsonAsync(process, """{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}""");
+    await WriteJsonAsync(process, """{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}""");
+    using (var toolsResponse = await ReadResponseAsync(process))
+    {
+        var tools = toolsResponse.RootElement.GetProperty("result").GetProperty("tools");
+        AssertEqual("codex_quota_title_status", tools[0].GetProperty("name").GetString()!);
+        AssertEqual("codex_quota_title_get_settings", tools[1].GetProperty("name").GetString()!);
+        AssertEqual("codex_quota_title_set_template", tools[2].GetProperty("name").GetString()!);
+    }
+
+    await WriteJsonAsync(process, """{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codex_quota_title_status","arguments":{}}}""");
+    using (var statusResponse = await ReadResponseAsync(process))
+    {
+        var status = statusResponse.RootElement.GetProperty("result").GetProperty("structuredContent");
+        AssertEqual("active", status.GetProperty("status").GetString()!);
+        AssertTrue(status.GetProperty("codexHomeObserved").GetBoolean(), "The MCP status tool did not observe CODEX_HOME.");
+        AssertEqual("EXPLICIT", status.GetProperty("codexHomeSource").GetString()!);
+        AssertTrue(status.GetProperty("codexHomeAvailable").GetBoolean(), "The MCP status tool did not report an available CODEX_HOME.");
+    }
+
+    await WriteJsonAsync(process, """{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"codex_quota_title_get_settings","arguments":{}}}""");
+    using (var settingsResponse = await ReadResponseAsync(process))
+    {
+        var settings = settingsResponse.RootElement.GetProperty("result").GetProperty("structuredContent");
+        AssertEqual(CodexQuotaTitleSettings.DefaultTemplate, settings.GetProperty("template").GetString()!);
+        AssertTrue(settings.GetProperty("enabled").GetBoolean(), "Default settings are not enabled.");
+    }
+
+    await WriteJsonAsync(process, """{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"codex_quota_title_set_template","arguments":{"template":"W %week_percent_remaining% | %base_title%"}}}""");
+    using (var setTemplateResponse = await ReadResponseAsync(process))
+    {
+        var settings = setTemplateResponse.RootElement.GetProperty("result").GetProperty("structuredContent");
+        AssertEqual("W %week_percent_remaining% | %base_title%", settings.GetProperty("template").GetString()!);
+        AssertTrue(settings.GetProperty("helperRefreshRequested").GetBoolean(), "The settings tool did not request a helper refresh.");
+    }
+
+    await process.StandardInput.DisposeAsync();
+    await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+    var standardError = await process.StandardError.ReadToEndAsync();
+    AssertTrue(process.ExitCode == 0, $"The MCP server exited with {process.ExitCode}: {standardError}");
+    AssertEqual(string.Empty, standardError);
+
+    var bootstrapContents = File.ReadAllText(fixture.BootstrapLogPath);
+    AssertContains(bootstrapContents, "MCP_PROCESS_ENTERED");
+    AssertContains(bootstrapContents, "MCP_PROCESS_CHAIN=");
+    AssertContains(bootstrapContents, $"CODEX_HOME_PRESENT=TRUE CODEX_HOME_VALUE={codexHome}");
+    AssertContains(bootstrapContents, "CODEX_HOME_SOURCE=EXPLICIT");
+    AssertContains(bootstrapContents, $"CODEX_HOME_RESOLVED_VALUE={codexHome}");
+    AssertContains(bootstrapContents, $"PROFILE_IDENTITY={ProfileIdentity.Create(codexHome).ProfileHash}");
+    AssertContains(bootstrapContents, "PLUGIN_ROOT_PRESENT=FALSE");
+    AssertContains(bootstrapContents, "PLUGIN_DATA_PRESENT=FALSE");
+    AssertContains(bootstrapContents, "MCP_INITIALIZED");
+    AssertContains(bootstrapContents, "MCP_TOOLS_LIST");
+    AssertContains(bootstrapContents, "MCP_STATUS_TOOL_CALLED");
+    AssertContains(bootstrapContents, "MCP_GET_SETTINGS_TOOL_CALLED");
+    AssertContains(bootstrapContents, "MCP_SET_TEMPLATE_TOOL_CALLED");
+}
+
+static string FindRepositoryRoot()
+{
+    for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+    {
+        if (File.Exists(Path.Combine(directory.FullName, "CodexQuotaTitle.sln")))
+        {
+            return directory.FullName;
+        }
+    }
+
+    throw new InvalidOperationException("Could not locate the repository root from the test output directory.");
+}
+
+static async Task WriteJsonAsync(Process process, string message)
+{
+    await process.StandardInput.WriteLineAsync(message);
+    await process.StandardInput.FlushAsync();
+}
+
+static async Task<JsonDocument> ReadResponseAsync(Process process)
+{
+    var response = await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10));
+    if (response is null)
+    {
+        var standardError = await process.StandardError.ReadToEndAsync();
+        throw new InvalidOperationException($"The MCP server closed stdout before responding: {standardError}");
+    }
+
+    return JsonDocument.Parse(response);
+}
+
+static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+{
+    var deadline = DateTimeOffset.UtcNow + timeout;
+    while (!condition())
+    {
+        if (DateTimeOffset.UtcNow >= deadline)
+        {
+            throw new TimeoutException("The expected asynchronous condition was not reached.");
+        }
+
+        await Task.Delay(10);
+    }
+}
+
+static void Win32TitleRoundTripPreservesSentinels()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var result = TitleOwnershipWin32RoundTrip.Run();
+    AssertTrue(result.SentinelsSurvived, "The Win32 title round-trip changed the title markers.");
+    AssertEqual(result.BaseTitle, result.RecoveredBaseTitle);
+}
+
+static void TitleWriteTestRendersWeeklyTemplate()
+{
+    var resetAt = new DateTimeOffset(2026, 8, 29, 18, 26, 0, TimeSpan.FromHours(2));
+    var quotas = CreateQuotas(null, new RateLimitWindow(0m, 10080, resetAt));
+
+    var rendered = new QuotaTemplateRenderer()
+        .RenderParts(TitleWriteTestService.DefaultTemplate, quotas)
+        .Render("Codex - Example Project");
+
+    AssertEqual("Codex - Example Project | W 100% • 29/08 18:26", rendered);
+}
+
+static async Task TitleWriteTestWritesAndCleansControlledWin32Window()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var result = await TitleWriteTestWin32Controlled.RunAsync();
+
+    AssertTrue(result.Applied, $"The controlled Win32 title write was not applied: {result.FailureReason}.");
+    AssertTrue(result.RoundTripVerified, "The controlled Win32 title write did not preserve sentinels.");
+    AssertTrue(result.CleanupCompleted, "The controlled Win32 title write was not cleaned up.");
+    AssertTrue(!result.OwnershipLost, "The controlled Win32 title write lost ownership unexpectedly.");
+}
+
+static async Task TitleWriteTestPreservesExternalBaseTitle()
+{
+    var titleWindow = new TestTitleWriteWindow(Environment.ProcessId, "Codex - Example Project");
+    var catalog = new TestTitleWriteWindowCatalog(titleWindow);
+    var log = new TestTitleWriteLog();
+    var delay = new CallbackTitleWriteTestDelay(() =>
+    {
+        var ownedSuffix = titleWindow.Title["Codex - Example Project".Length..];
+        titleWindow.Title = string.Concat("Codex - Renamed Elsewhere", ownedSuffix);
+    });
+    var service = CreateTitleWriteTestService(catalog, titleWindow, delay, log);
+
+    var result = await service.ExecuteAsync(CreateTitleWriteTestRequest());
+
+    AssertTrue(result.CleanupCompleted, "Cleanup did not complete after the external base-title change.");
+    AssertEqual("Codex - Renamed Elsewhere", titleWindow.Title);
+    AssertContains(string.Join(Environment.NewLine, log.Markers), "TITLE_TEST_CLEANUP_OK");
+}
+
+static async Task TitleWriteTestStopsWhenOwnershipIsLost()
+{
+    var titleWindow = new TestTitleWriteWindow(Environment.ProcessId, "Codex - Example Project");
+    var log = new TestTitleWriteLog();
+    var service = CreateTitleWriteTestService(
+        new TestTitleWriteWindowCatalog(titleWindow),
+        titleWindow,
+        new CallbackTitleWriteTestDelay(() => titleWindow.Title = "Codex - Replaced Elsewhere"),
+        log);
+
+    var result = await service.ExecuteAsync(CreateTitleWriteTestRequest());
+
+    AssertTrue(result.OwnershipLost, "The title write test did not detect lost ownership.");
+    AssertTrue(!result.CleanupCompleted, "The title write test wrote after ownership was lost.");
+    AssertEqual("Codex - Replaced Elsewhere", titleWindow.Title);
+    AssertTrue(titleWindow.SetCallCount == 1, "The title write test attempted a cleanup write after ownership was lost.");
+    AssertContains(string.Join(Environment.NewLine, log.Markers), "TITLE_TEST_OWNERSHIP_LOST");
+}
+
+static async Task TitleWriteTestRejectsInvalidAndAmbiguousTargets()
+{
+    var invalidWindow = new TestTitleWriteWindow(Environment.ProcessId, "Codex - Example Project") { IsWindowResult = false };
+    var invalidResult = await CreateTitleWriteTestService(
+        new TestTitleWriteWindowCatalog(invalidWindow),
+        invalidWindow,
+        new CallbackTitleWriteTestDelay(static () => { }),
+        new TestTitleWriteLog()).ExecuteAsync(CreateTitleWriteTestRequest());
+    AssertTrue(!invalidResult.Applied, "The title write test wrote to an invalid HWND.");
+    AssertTrue(invalidWindow.SetCallCount == 0, "The title write test called SetWindowText for an invalid HWND.");
+
+    var ambiguousWindow = new TestTitleWriteWindow(Environment.ProcessId, "Codex - Example Project");
+    var ambiguousCatalog = new TestTitleWriteWindowCatalog(ambiguousWindow) { ReturnAmbiguousCandidates = true };
+    var ambiguousResult = await CreateTitleWriteTestService(
+        ambiguousCatalog,
+        ambiguousWindow,
+        new CallbackTitleWriteTestDelay(static () => { }),
+        new TestTitleWriteLog()).ExecuteAsync(CreateTitleWriteTestRequest());
+    AssertTrue(!ambiguousResult.Applied, "The title write test wrote despite ambiguous correlation.");
+    AssertTrue(ambiguousWindow.SetCallCount == 0, "The title write test called SetWindowText for an ambiguous target.");
+}
+
+static void AutomaticRefreshPreservesExternalBaseTitle()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var ownership = new TitleOwnership(new TestSentinels());
+    var window = new TestTitleWriteWindow(Environment.ProcessId, "Codex - Example Project");
+    var service = new AutomaticTitleUpdateService(window, ownership);
+    var first = service.Apply(CreateAutomaticTitleRequest(window, true));
+    AssertTrue(first.Success, "The first automatic title refresh failed.");
+
+    var suffix = window.Title["Codex - Example Project".Length..];
+    window.Title = string.Concat("PanelTame - Codex", suffix);
+    var second = service.Apply(CreateAutomaticTitleRequest(window, true));
+
+    AssertTrue(second.Success, "The refresh after an external base-title change failed.");
+    AssertEqual("PanelTame - Codex", ownership.GetBaseTitle(window.Title));
+}
+
+static void AutomaticRefreshDoesNotDuplicateOwnedContent()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var ownership = new TitleOwnership(new TestSentinels());
+    var window = new TestTitleWriteWindow(Environment.ProcessId, "Codex - Example Project");
+    var service = new AutomaticTitleUpdateService(window, ownership);
+    AssertTrue(service.Apply(CreateAutomaticTitleRequest(window, true)).Success, "The first automatic title refresh failed.");
+    AssertTrue(service.Apply(CreateAutomaticTitleRequest(window, true)).Success, "The second automatic title refresh failed.");
+
+    AssertTrue(CountOccurrences(window.Title, "[start]") == 1, "Two refreshes duplicated the owned title zone.");
+    AssertEqual("Codex - Example Project", ownership.GetBaseTitle(window.Title));
+}
+
+static void AutomaticRefreshDisabledCleansOwnedContent()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var ownership = new TitleOwnership(new TestSentinels());
+    var window = new TestTitleWriteWindow(Environment.ProcessId, "Codex - Example Project");
+    var service = new AutomaticTitleUpdateService(window, ownership);
+    AssertTrue(service.Apply(CreateAutomaticTitleRequest(window, true)).Success, "The automatic title refresh failed.");
+    var cleanup = service.Apply(CreateAutomaticTitleRequest(window, false));
+
+    AssertTrue(cleanup.Cleaned, "Disabled settings did not clean the owned title zone.");
+    AssertEqual("Codex - Example Project", window.Title);
+}
+
+static void AutomaticRefreshOwnershipLostPreventsWrite()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var ownership = new TitleOwnership(new TestSentinels());
+    var window = new TestTitleWriteWindow(Environment.ProcessId, "Codex - Example Project");
+    var service = new AutomaticTitleUpdateService(window, ownership);
+    AssertTrue(service.Apply(CreateAutomaticTitleRequest(window, true)).Success, "The automatic title refresh failed.");
+    var setCallsBeforeLoss = window.SetCallCount;
+    window.Title = "Externally replaced title";
+    var cleanup = service.Apply(CreateAutomaticTitleRequest(window, false));
+
+    AssertTrue(!cleanup.Changed, "Cleanup wrote after title ownership was lost.");
+    AssertEqual("Externally replaced title", window.Title);
+    AssertTrue(window.SetCallCount == setCallsBeforeLoss, "Cleanup modified a title it no longer owned.");
+}
+
+static AutomaticTitleUpdateRequest CreateAutomaticTitleRequest(TestTitleWriteWindow window, bool enabled) =>
+    new(
+        Environment.ProcessId,
+        AutomaticTitleUpdateService.UnambiguousCorrelation,
+        [new WindowCandidate(window.Handle, window.ProcessId, "ChatGPT.exe", AutomaticTitleUpdateService.ExpectedWindowClassName, window.Title, true, Array.Empty<CodexQuotaTitle.Processes.InspectedProcess>(), Array.Empty<int>())],
+        enabled,
+        CodexQuotaTitleSettings.DefaultTemplate,
+        CodexQuotaTitleSettings.DefaultDateFormat,
+        CreateQuotas(null, new RateLimitWindow(0m, 10080, new DateTimeOffset(2026, 8, 29, 18, 26, 0, TimeSpan.FromHours(2)))));
+
+static int CountOccurrences(string value, string pattern)
+{
+    var count = 0;
+    var offset = 0;
+    while ((offset = value.IndexOf(pattern, offset, StringComparison.Ordinal)) >= 0)
+    {
+        count++;
+        offset += pattern.Length;
+    }
+
+    return count;
+}
+
+static TitleWriteTestService CreateTitleWriteTestService(
+    ITitleWriteTestWindowCatalog catalog,
+    ITitleWriteTestWindowAccessor accessor,
+    ITitleWriteTestDelay delay,
+    ITitleWriteTestLog log) =>
+    new(catalog, accessor, delay, log);
+
+static TitleWriteTestRequest CreateTitleWriteTestRequest() =>
+    new(
+        Environment.ProcessId,
+        TitleWriteTestService.UnambiguousCorrelation,
+        TitleWriteTestService.DefaultTemplate,
+        CreateQuotas(null, new RateLimitWindow(0m, 10080, new DateTimeOffset(2026, 8, 29, 18, 26, 0, TimeSpan.FromHours(2)))));
+
+static QuotaReadResult CreateQuotas(RateLimitWindow? primary, RateLimitWindow? secondary) =>
+    new(new QuotaSnapshot("codex", "Codex", primary, secondary), new Dictionary<string, QuotaSnapshot>());
+
+static void AssertEqual(string expected, string actual)
+{
+    if (!string.Equals(expected, actual, StringComparison.Ordinal))
+    {
+        throw new InvalidOperationException($"Expected '{expected}' but got '{actual}'.");
+    }
+}
+
+static void AssertThrows<TException>(Action action)
+    where TException : Exception
+{
+    try
+    {
+        action();
+    }
+    catch (TException)
+    {
+        return;
+    }
+
+    throw new InvalidOperationException($"Expected {typeof(TException).Name}.");
+}
+
+static void AssertContains(string value, string expected)
+{
+    AssertTrue(value.Contains(expected, StringComparison.Ordinal), $"Expected '{expected}' in '{value}'.");
+}
+
+static void AssertTrue(bool condition, string message)
+{
+    if (!condition)
+    {
+        throw new InvalidOperationException(message);
+    }
+}
+
+file sealed class TestSentinels : ITitleSentinelStrategy
+{
+    public string StartMarker => "[start]";
+
+    public string EndMarker => "[end]";
+}
+
+file sealed class BootstrapLogFixture : IDisposable
+{
+    private readonly string _directoryPath = Path.Combine(Path.GetTempPath(), "cqt-bootstrap-tests", Guid.NewGuid().ToString("N"));
+
+    public HookBootstrapLog CreateLog() => new(_directoryPath);
+
+    public string ReadContents() => File.ReadAllText(Path.Combine(_directoryPath, "hook-bootstrap.log"));
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_directoryPath))
+        {
+            Directory.Delete(_directoryPath, recursive: true);
+        }
+    }
+}
+
+file sealed class SettingsFixture : IDisposable
+{
+    private readonly string _rootDirectory = Path.Combine(Path.GetTempPath(), "cqt-settings-tests", Guid.NewGuid().ToString("N"));
+
+    public SettingsFixture()
+    {
+        var profile = ProfileIdentity.Create(Path.Combine(_rootDirectory, "profile"));
+        Store = new CodexQuotaTitleSettingsStore(new LocalAppDataSettingsPathResolver(_rootDirectory).GetPaths(profile));
+    }
+
+    public CodexQuotaTitleSettingsStore Store { get; }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_rootDirectory))
+        {
+            Directory.Delete(_rootDirectory, recursive: true);
+        }
+    }
+}
+
+file sealed class EnvironmentVariableScope : IDisposable
+{
+    private readonly string _name;
+    private readonly string? _previousValue;
+
+    public EnvironmentVariableScope(string name, string? value)
+    {
+        _name = name;
+        _previousValue = Environment.GetEnvironmentVariable(name);
+        Environment.SetEnvironmentVariable(name, value);
+    }
+
+    public void Dispose() => Environment.SetEnvironmentVariable(_name, _previousValue);
+}
+
+file sealed class McpProcessFixture : IDisposable
+{
+    public McpProcessFixture()
+    {
+        DirectoryPath = Path.Combine(Path.GetTempPath(), "cqt-mcp-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(DirectoryPath);
+    }
+
+    public string DirectoryPath { get; }
+
+    public string BootstrapLogPath => Path.Combine(DirectoryPath, "CodexQuotaTitle", "mcp-bootstrap.log");
+
+    public void Dispose()
+    {
+        for (var attempt = 0; attempt < 20 && Directory.Exists(DirectoryPath); attempt++)
+        {
+            try
+            {
+                Directory.Delete(DirectoryPath, recursive: true);
+            }
+            catch (IOException) when (attempt < 19)
+            {
+                Thread.Sleep(50);
+            }
+        }
+    }
+}
+
+file sealed class TestProcessLiveness : IProcessLiveness
+{
+    private readonly HashSet<int> _runningProcessIds = [];
+
+    public bool IsRunning(int processId) => _runningProcessIds.Contains(processId);
+
+    public void Add(int processId) => _runningProcessIds.Add(processId);
+}
+
+file sealed class TestHelperProcessStarter : IHelperProcessStarter
+{
+    private readonly TestProcessLiveness _liveness;
+    private int _nextProcessId = 7_000;
+
+    public TestHelperProcessStarter(TestProcessLiveness liveness)
+    {
+        _liveness = liveness;
+    }
+
+    public List<McpHelperStartupRequest> Requests { get; } = [];
+
+    public int Start(McpHelperStartupRequest request)
+    {
+        var helperPid = _nextProcessId++;
+        Requests.Add(request);
+        _liveness.Add(helperPid);
+        new HelperRuntimeStateStore(request.RuntimePaths).Write(new HelperRuntimeState(
+            request.Profile.ProfileHash,
+            request.Origin,
+            helperPid,
+            request.HostChatGptPid,
+            request.HostCodexPid,
+            true,
+            false,
+            null,
+            Array.Empty<HelperQuotaSnapshot>(),
+            0,
+            "WINDOW_CORRELATION_AMBIGUOUS",
+            Array.Empty<HelperWindowCandidate>(),
+            DateTimeOffset.UtcNow));
+        return helperPid;
+    }
+}
+
+file sealed class TestHostProcessLifetime : IHostProcessLifetime
+{
+    private readonly TaskCompletionSource _exit = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task WaitForExitAsync(int processId, CancellationToken cancellationToken) =>
+        _exit.Task.WaitAsync(cancellationToken);
+
+    public void Complete() => _exit.TrySetResult();
+}
+
+file sealed class TestAppServerSessionFactory : IHelperAppServerSessionFactory
+{
+    public List<string> CodexHomes { get; } = [];
+
+    public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public TestAppServerSession Session { get; } = new();
+
+    public Task<IHelperAppServerSession> StartAsync(string codexHome, CancellationToken cancellationToken)
+    {
+        CodexHomes.Add(codexHome);
+        Started.TrySetResult();
+        return Task.FromResult<IHelperAppServerSession>(Session);
+    }
+}
+
+file sealed class TestAppServerSession : IHelperAppServerSession
+{
+    public event EventHandler<QuotaSnapshot>? RateLimitsUpdated;
+
+    public int ReadRateLimitsCallCount { get; private set; }
+
+    public Task<CodexAccountSummary> ReadAccountAsync(CancellationToken cancellationToken) =>
+        Task.FromResult(new CodexAccountSummary("chatgpt", "not-for-diagnostics@example.test", "pro", false));
+
+    public Task<QuotaReadResult> ReadRateLimitsAsync(CancellationToken cancellationToken)
+    {
+        ReadRateLimitsCallCount++;
+        return Task.FromResult(new QuotaReadResult(
+            new QuotaSnapshot(
+                "codex",
+                "Codex",
+                new RateLimitWindow(37m, 300, DateTimeOffset.UtcNow.AddHours(2)),
+                new RateLimitWindow(12m, 10080, DateTimeOffset.UtcNow.AddDays(4))),
+            new Dictionary<string, QuotaSnapshot>()));
+    }
+
+    public void PublishQuota(QuotaSnapshot snapshot) => RateLimitsUpdated?.Invoke(this, snapshot);
+
+    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+file sealed class TestAutomaticTitleUpdateService : IAutomaticTitleUpdateService
+{
+    public List<AutomaticTitleUpdateRequest> Requests { get; } = [];
+
+    public AutomaticTitleUpdateResult Apply(AutomaticTitleUpdateRequest request)
+    {
+        Requests.Add(request);
+        return new AutomaticTitleUpdateResult(true, false, false, false, request.ExpectedCorrelation, 1, null, null);
+    }
+}
+
+file sealed class TestHostWindowProvider : IHostWindowProvider
+{
+    public List<int> RequestedProcessIds { get; } = [];
+
+    public TaskCompletionSource Enumerated { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public IReadOnlyList<WindowCandidate> ListTopLevelWindowsForProcess(int processId)
+    {
+        RequestedProcessIds.Add(processId);
+        Enumerated.TrySetResult();
+        return
+        [
+            new WindowCandidate(
+                (nint)0x1234,
+                (uint)processId,
+                "ChatGPT.exe",
+                "Chrome_WidgetWin_1",
+                "Codex - Example Project",
+                true,
+                Array.Empty<CodexQuotaTitle.Processes.InspectedProcess>(),
+                Array.Empty<int>()),
+            new WindowCandidate(
+                (nint)0x5678,
+                (uint)processId,
+                "ChatGPT.exe",
+                "Chrome_WidgetWin_1",
+                string.Empty,
+                false,
+                Array.Empty<CodexQuotaTitle.Processes.InspectedProcess>(),
+                Array.Empty<int>()),
+        ];
+    }
+}
+
+file sealed class TestSettingsChangeWatcherFactory : ISettingsChangeWatcherFactory
+{
+    public ISettingsChangeWatcher Create(CodexQuotaTitleSettingsPaths paths) => new TestSettingsChangeWatcher();
+}
+
+file sealed class TestSettingsChangeWatcher : ISettingsChangeWatcher
+{
+    public Task WaitForChangeAsync(CancellationToken cancellationToken) => Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+
+    public void Dispose()
+    {
+    }
+}
+
+file sealed class TestTitleWriteWindow : ITitleWriteTestWindowAccessor, IWindowTitleAccessor
+{
+    public TestTitleWriteWindow(int processId, string title)
+    {
+        ProcessId = (uint)processId;
+        Title = title;
+    }
+
+    public nint Handle { get; } = (nint)0x7654;
+
+    public uint ProcessId { get; }
+
+    public string Title { get; set; }
+
+    public bool IsWindowResult { get; set; } = true;
+
+    public int SetCallCount { get; private set; }
+
+    public bool IsWindow(nint handle) => IsWindowResult && handle == Handle;
+
+    public uint GetProcessId(nint handle) => ProcessId;
+
+    public bool IsVisible(nint handle) => true;
+
+    public string GetClassName(nint handle) => TitleWriteTestService.DefaultWindowClassName;
+
+    public string GetWindowTitle(nint handle) => Title;
+
+    public bool SetWindowTitle(nint handle, string title, out int win32Error)
+    {
+        SetCallCount++;
+        win32Error = 0;
+        Title = title;
+        return true;
+    }
+}
+
+file sealed class TestTitleWriteWindowCatalog : ITitleWriteTestWindowCatalog
+{
+    private readonly TestTitleWriteWindow _window;
+
+    public TestTitleWriteWindowCatalog(TestTitleWriteWindow window)
+    {
+        _window = window;
+    }
+
+    public bool ReturnAmbiguousCandidates { get; set; }
+
+    public IReadOnlyList<WindowCandidate> ListTopLevelWindowsForProcess(uint processId)
+    {
+        if (processId != _window.ProcessId)
+        {
+            return Array.Empty<WindowCandidate>();
+        }
+
+        var candidates = new List<WindowCandidate>
+        {
+            CreateCandidate(_window.Handle, _window.ProcessId, _window.Title),
+        };
+        if (ReturnAmbiguousCandidates)
+        {
+            candidates.Add(CreateCandidate((nint)0x7655, _window.ProcessId, "Codex - Other"));
+        }
+
+        return candidates;
+    }
+
+    private static WindowCandidate CreateCandidate(nint handle, uint processId, string title) =>
+        new(
+            handle,
+            processId,
+            "ChatGPT.exe",
+            TitleWriteTestService.DefaultWindowClassName,
+            title,
+            true,
+            Array.Empty<CodexQuotaTitle.Processes.InspectedProcess>(),
+            Array.Empty<int>());
+}
+
+file sealed class CallbackTitleWriteTestDelay : ITitleWriteTestDelay
+{
+    private readonly Action _callback;
+
+    public CallbackTitleWriteTestDelay(Action callback)
+    {
+        _callback = callback;
+    }
+
+    public Task WaitAsync(CancellationToken cancellationToken)
+    {
+        _callback();
+        return Task.CompletedTask;
+    }
+}
+
+file sealed class TestTitleWriteLog : ITitleWriteTestLog
+{
+    public List<string> Markers { get; } = [];
+
+    public void Write(string marker) => Markers.Add(marker);
+}

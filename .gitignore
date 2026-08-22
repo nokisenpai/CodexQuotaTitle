@@ -1,0 +1,41 @@
+# .NET build output
+[Bb]in/
+[Oo]bj/
+*.pdb
+*.nupkg
+*.snupkg
+
+# IDEs and test output
+.vs/
+.idea/
+*.suo
+*.user
+TestResults/
+coverage/
+artifacts/
+build/
+
+# Local runtime state, diagnostics, and developer marketplaces
+.codex/
+.agents/
+logs/
+*.log
+*.tmp
+*.cache
+runtime/
+settings.json
+appsettings.Local.json
+.env
+.env.*
+!.env.example
+
+# The two single-file, self-contained executables are release artifacts and
+# must remain versioned inside the plugin package.
+!plugins/
+!plugins/codex-quota-title/
+!plugins/codex-quota-title/bin/
+!plugins/codex-quota-title/bin/win-x64/
+!plugins/codex-quota-title/bin/win-x64/CodexQuotaTitle.exe
+!plugins/codex-quota-title/bin/mcp/
+!plugins/codex-quota-title/bin/mcp/win-x64/
+!plugins/codex-quota-title/bin/mcp/win-x64/CodexQuotaTitle.Mcp.exe
