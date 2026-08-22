@@ -15,9 +15,12 @@ coverage/
 artifacts/
 build/
 
-# Local runtime state, diagnostics, and developer marketplaces
+# Local runtime state and diagnostics
 .codex/
-.agents/
+.agents/*
+!.agents/plugins/
+.agents/plugins/*
+!.agents/plugins/marketplace.json
 logs/
 *.log
 *.tmp
