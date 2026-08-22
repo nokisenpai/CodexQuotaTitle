@@ -4,6 +4,7 @@ using CodexQuotaTitle.Titles;
 using CodexQuotaTitle.Integration;
 using CodexQuotaTitle.Mcp;
 using CodexQuotaTitle.Accounts;
+using CodexQuotaTitle.AppServer;
 using CodexQuotaTitle.Settings;
 using System.Diagnostics;
 using System.Text.Json;
@@ -49,6 +50,7 @@ var tests = new (string Name, Action Execute)[]
     ("Bootstrap log records a missing launcher", BootstrapLogRecordsMissingLauncher),
     ("Bootstrap log records an early helper failure without secrets", BootstrapLogRecordsEarlyHelperFailure),
     ("Bootstrap log tolerates an unwritable target", BootstrapLogToleratesUnwritableTarget),
+    ("Helper App Server diagnostics redact sensitive messages", HelperServiceLogRedactsSensitiveAppServerMessages),
     ("MCP startup uses explicit CODEX_HOME", McpStartupContextUsesExplicitCodexHome),
     ("MCP startup resolves the implicit default CODEX_HOME", McpStartupContextResolvesImplicitDefaultCodexHome),
     ("Explicit and implicit CODEX_HOME values share an identity", McpStartupContextMatchesEquivalentExplicitAndImplicitHomes),
@@ -59,6 +61,8 @@ var tests = new (string Name, Action Execute)[]
     ("MCP replaces a stale dead helper runtime state", McpBootstrapperReplacesStaleState),
     ("MCP can start distinct helpers for distinct profiles", () => McpBootstrapperAllowsDistinctProfiles().GetAwaiter().GetResult()),
     ("Helper uses the host PID, CODEX_HOME, and exits with the host", () => McpHelperServiceUsesBootstrapHintsAndHostLifecycle().GetAwaiter().GetResult()),
+    ("Helper records safe App Server startup diagnostics", () => McpHelperServiceRecordsAppServerStartupDiagnostics().GetAwaiter().GetResult()),
+    ("MCP status retains App Server runtime diagnostics", McpHelperStatusRetainsAppServerDiagnostics),
     ("Helper releases state when the host exits during initialization", () => McpHelperServiceStopsWhenHostExitsDuringInitialization().GetAwaiter().GetResult()),
     ("Helper cleanup restores the base after a fully custom title", () => McpHelperCleanupRestoresBaseAfterFullyCustomTitle().GetAwaiter().GetResult()),
     ("Helper refreshes after a quota notification", () => McpHelperRefreshesAfterQuotaNotification().GetAwaiter().GetResult()),
@@ -649,6 +653,27 @@ static void BootstrapLogToleratesUnwritableTarget()
     }
 }
 
+static void HelperServiceLogRedactsSensitiveAppServerMessages()
+{
+    var directoryPath = Path.Combine(Path.GetTempPath(), "cqt-helper-log-tests", Guid.NewGuid().ToString("N"));
+    try
+    {
+        var log = new HelperServiceLog(directoryPath);
+        log.AppendException("APP_SERVER_UNAVAILABLE", new CodexAppServerException("token=not-for-diagnostics"));
+        var contents = File.ReadAllText(Path.Combine(directoryPath, "helper-service.log"));
+
+        AssertContains(contents, "APP_SERVER_UNAVAILABLE EXCEPTION_TYPE=CodexAppServerException MESSAGE=[REDACTED]");
+        AssertTrue(!contents.Contains("not-for-diagnostics", StringComparison.Ordinal), "The helper log wrote a token-like value.");
+    }
+    finally
+    {
+        if (Directory.Exists(directoryPath))
+        {
+            Directory.Delete(directoryPath, recursive: true);
+        }
+    }
+}
+
 static void McpStartupContextUsesExplicitCodexHome()
 {
     const string codexHome = "C:\\test\\codex";
@@ -919,6 +944,9 @@ static async Task McpHelperServiceUsesBootstrapHintsAndHostLifecycle()
         AssertEqual(startupContext.CodexHome!, appServerFactory.CodexHomes.Single());
         AssertTrue(windowProvider.RequestedProcessIds.Single() == 333, "Windows were not filtered with HOST_CHATGPT_PID.");
         AssertTrue(runningState!.AppServerConnected, "The helper did not report an App Server connection.");
+        AssertEqual("connected", runningState.AppServerStatus);
+        AssertTrue(runningState.AppServerLastError is null, "A successful App Server connection retained an error.");
+        AssertTrue(runningState.AppServerLastExceptionType is null, "A successful App Server connection retained an exception type.");
         AssertTrue(runningState.Quotas.Count == 1, "The helper did not persist normalized quotas.");
         AssertTrue(runningState.CandidateWindowCount == 2, "The helper did not persist all top-level host windows.");
         AssertEqual("WINDOW_CORRELATION_UNAMBIGUOUS", runningState.WindowCorrelation);
@@ -934,6 +962,97 @@ static async Task McpHelperServiceUsesBootstrapHintsAndHostLifecycle()
         AssertTrue(finalResult.AcquiredProfileSingleton, "The primary helper did not own the profile singleton.");
         var stoppedState = stateStore.TryRead();
         AssertTrue(stoppedState is not null && !stoppedState.IsRunning, "The helper did not stop after HOST_CHATGPT_PID exited.");
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static async Task McpHelperServiceRecordsAppServerStartupDiagnostics()
+{
+    var timedOut = await RunHelperWithAppServerFailureAsync(new OperationCanceledException("Ignored by the safe timeout diagnostic."));
+    AssertEqual("timed-out", timedOut.AppServerStatus);
+    AssertEqual("The Codex App Server startup timed out.", timedOut.AppServerLastError!);
+    AssertEqual(nameof(OperationCanceledException), timedOut.AppServerLastExceptionType!);
+    AssertTrue(!timedOut.AppServerConnected, "A timed-out App Server was reported as connected.");
+    AssertTrue(timedOut.LastError is null, "An App Server error changed the title/window error field.");
+
+    var unavailable = await RunHelperWithAppServerFailureAsync(new CodexAppServerException("token=not-for-diagnostics"));
+    AssertEqual("unavailable", unavailable.AppServerStatus);
+    AssertEqual("[REDACTED]", unavailable.AppServerLastError!);
+    AssertEqual(nameof(CodexAppServerException), unavailable.AppServerLastExceptionType!);
+
+    var failed = await RunHelperWithAppServerFailureAsync(new InvalidOperationException("cookie=not-for-diagnostics"));
+    AssertEqual("failed", failed.AppServerStatus);
+    AssertEqual("[REDACTED]", failed.AppServerLastError!);
+    AssertEqual(nameof(InvalidOperationException), failed.AppServerLastExceptionType!);
+}
+
+static void McpHelperStatusRetainsAppServerDiagnostics()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-mcp-status-tests", Guid.NewGuid().ToString("N")));
+    var runtimePaths = HelperRuntimePaths.ForProfile(profile.ProfileHash);
+    try
+    {
+        new HelperRuntimeStateStore(runtimePaths).Write(new HelperRuntimeState(
+            profile.ProfileHash,
+            "mcp",
+            7_001,
+            333,
+            222,
+            false,
+            false,
+            null,
+            Array.Empty<HelperQuotaSnapshot>(),
+            0,
+            "WINDOW_CORRELATION_AMBIGUOUS",
+            Array.Empty<HelperWindowCandidate>(),
+            DateTimeOffset.UtcNow)
+        {
+            AppServerStatus = "unavailable",
+            AppServerLastError = "The App Server executable could not be started.",
+            AppServerLastExceptionType = nameof(CodexAppServerException),
+        });
+        var bootstrapper = new McpHelperBootstrapper(
+            new McpBootstrapLog(runtimePaths.DirectoryPath),
+            new McpStartupContext(profile.RawCodexHome, profile),
+            new McpProcessTree(null, Array.Empty<McpProcessNode>()));
+
+        var status = bootstrapper.GetStatus();
+
+        AssertEqual("unavailable", status.AppServerStatus);
+        AssertEqual("The App Server executable could not be started.", status.AppServerLastError!);
+        AssertEqual(nameof(CodexAppServerException), status.AppServerLastExceptionType!);
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static async Task<HelperRuntimeState> RunHelperWithAppServerFailureAsync(Exception exception)
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-app-server-diagnostics-tests", Guid.NewGuid().ToString("N")));
+    var runtimePaths = new HelperRuntimePaths(Path.Combine(Path.GetTempPath(), "cqt-app-server-diagnostics-tests", Guid.NewGuid().ToString("N")));
+    try
+    {
+        var hostLifetime = new TestHostProcessLifetime();
+        var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(new LocalAppDataSettingsPathResolver(Path.Combine(runtimePaths.DirectoryPath, "settings")));
+        var service = new McpHelperService(
+            new FailingTestAppServerSessionFactory(exception),
+            hostLifetime,
+            new TestHostWindowProvider(),
+            settingsFactory,
+            new TestSettingsChangeWatcherFactory(),
+            new TestAutomaticTitleUpdateService());
+        var run = service.RunAsync(new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths));
+        var stateStore = new HelperRuntimeStateStore(runtimePaths);
+        await WaitUntilAsync(() => stateStore.TryRead()?.AppServerStatus != "not-started", TimeSpan.FromSeconds(5));
+        hostLifetime.Complete();
+        var result = await run.WaitAsync(TimeSpan.FromSeconds(5));
+
+        return result.FinalState ?? throw new InvalidOperationException("The failed helper did not return a final runtime state.");
     }
     finally
     {
@@ -1134,6 +1253,9 @@ static async Task McpStdioServerCompletesBootstrapHandshake()
         AssertTrue(status.GetProperty("codexHomeObserved").GetBoolean(), "The MCP status tool did not observe CODEX_HOME.");
         AssertEqual("EXPLICIT", status.GetProperty("codexHomeSource").GetString()!);
         AssertTrue(status.GetProperty("codexHomeAvailable").GetBoolean(), "The MCP status tool did not report an available CODEX_HOME.");
+        AssertEqual("not-started", status.GetProperty("appServerStatus").GetString()!);
+        AssertTrue(status.GetProperty("appServerLastError").ValueKind == JsonValueKind.Null, "The inactive MCP status reported an unexpected App Server error.");
+        AssertTrue(status.GetProperty("appServerLastExceptionType").ValueKind == JsonValueKind.Null, "The inactive MCP status reported an unexpected App Server exception type.");
     }
 
     await WriteJsonAsync(process, """{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"codex_quota_title_get_settings","arguments":{}}}""");
@@ -1819,6 +1941,19 @@ file sealed class BlockingTestAppServerSessionFactory : IHelperAppServerSessionF
         await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
         throw new InvalidOperationException("The blocking App Server factory unexpectedly completed.");
     }
+}
+
+file sealed class FailingTestAppServerSessionFactory : IHelperAppServerSessionFactory
+{
+    private readonly Exception _exception;
+
+    public FailingTestAppServerSessionFactory(Exception exception)
+    {
+        _exception = exception;
+    }
+
+    public Task<IHelperAppServerSession> StartAsync(string codexHome, CancellationToken cancellationToken) =>
+        Task.FromException<IHelperAppServerSession>(_exception);
 }
 
 file sealed class TestAppServerSession : IHelperAppServerSession

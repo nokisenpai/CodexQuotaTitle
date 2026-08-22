@@ -33,17 +33,7 @@ public sealed class HelperServiceLog
     }
 
     public void AppendException(string marker, Exception exception) =>
-        TryAppend($"{marker} EXCEPTION_TYPE={exception.GetType().Name} MESSAGE={exception.Message}");
+        TryAppend($"{marker} EXCEPTION_TYPE={exception.GetType().Name} MESSAGE={DiagnosticMessageSanitizer.Sanitize(exception.Message)}");
 
-    private static string Sanitize(string value)
-    {
-        var singleLine = value.Replace('\r', ' ').Replace('\n', ' ').Trim();
-        return singleLine.Contains("token", StringComparison.OrdinalIgnoreCase) ||
-               singleLine.Contains("cookie", StringComparison.OrdinalIgnoreCase) ||
-               singleLine.Contains("api_key", StringComparison.OrdinalIgnoreCase) ||
-               singleLine.Contains("apikey", StringComparison.OrdinalIgnoreCase) ||
-               singleLine.Contains("secret", StringComparison.OrdinalIgnoreCase)
-            ? "[REDACTED]"
-            : singleLine;
-    }
+    private static string Sanitize(string value) => DiagnosticMessageSanitizer.Sanitize(value);
 }

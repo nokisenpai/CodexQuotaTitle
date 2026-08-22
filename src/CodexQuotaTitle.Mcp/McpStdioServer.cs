@@ -9,7 +9,7 @@ namespace CodexQuotaTitle.Mcp;
 public sealed class McpStdioServer
 {
     private const string ServerName = "codex_quota_title";
-    private const string ServerVersion = "0.1.3";
+    private const string ServerVersion = "0.1.4";
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web);
     private readonly McpBootstrapLog _bootstrapLog;
     private readonly int _processId;
@@ -208,6 +208,9 @@ public sealed class McpStdioServer
             ["helperRunning"] = helperStatus.HelperRunning,
             ["helperPid"] = helperStatus.HelperPid,
             ["appServerConnected"] = helperStatus.AppServerConnected,
+            ["appServerStatus"] = helperStatus.AppServerStatus,
+            ["appServerLastError"] = helperStatus.AppServerLastError,
+            ["appServerLastExceptionType"] = helperStatus.AppServerLastExceptionType,
             ["template"] = helperStatus.ActiveTemplate,
             ["dateFormat"] = helperStatus.DateFormat,
             ["enabled"] = helperStatus.Enabled,

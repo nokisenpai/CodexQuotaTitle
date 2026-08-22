@@ -19,6 +19,9 @@ public sealed record McpHelperStatus(
     bool HelperRunning,
     int? HelperPid,
     bool AppServerConnected,
+    string AppServerStatus,
+    string? AppServerLastError,
+    string? AppServerLastExceptionType,
     IReadOnlyList<HelperQuotaSnapshot> Quotas,
     int? CandidateWindowCount,
     string? WindowCorrelation,
@@ -116,7 +119,7 @@ public sealed class McpHelperBootstrapper
     {
         if (_startupContext.ProfileIdentity is not { } profile)
         {
-            return new McpHelperStatus(null, false, null, false, Array.Empty<HelperQuotaSnapshot>(), null, null, null, null, null, null, null, null, null, null, Array.Empty<HelperWindowCandidate>());
+            return new McpHelperStatus(null, false, null, false, "not-started", null, null, Array.Empty<HelperQuotaSnapshot>(), null, null, null, null, null, null, null, null, null, null, Array.Empty<HelperWindowCandidate>());
         }
 
         var state = new HelperRuntimeStateStore(HelperRuntimePaths.ForProfile(profile.ProfileHash)).TryRead();
@@ -126,6 +129,9 @@ public sealed class McpHelperBootstrapper
             helperRunning,
             helperRunning ? state!.HelperPid : null,
             helperRunning && state!.AppServerConnected,
+            state?.AppServerStatus ?? "not-started",
+            state?.AppServerLastError,
+            state?.AppServerLastExceptionType,
             state?.Quotas ?? Array.Empty<HelperQuotaSnapshot>(),
             state?.CandidateWindowCount,
             state?.WindowCorrelation,

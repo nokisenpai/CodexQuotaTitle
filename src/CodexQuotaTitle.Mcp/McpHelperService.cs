@@ -37,7 +37,7 @@ public sealed record McpHelperServiceRunResult(bool AcquiredProfileSingleton, He
 
 public sealed class McpHelperService
 {
-    public const string HelperVersion = "0.1.3";
+    public const string HelperVersion = "0.1.4";
     private readonly IHelperAppServerSessionFactory _appServerSessionFactory;
     private readonly IHostProcessLifetime _hostProcessLifetime;
     private readonly IHostWindowProvider _hostWindowProvider;
@@ -133,7 +133,14 @@ public sealed class McpHelperService
 
                     log.TryAppend("RATE_LIMITS_UPDATED_NOTIFICATION");
                 };
-                state = state with { AppServerConnected = true, UpdatedAtUtc = DateTimeOffset.UtcNow };
+                state = state with
+                {
+                    AppServerConnected = true,
+                    AppServerStatus = "connected",
+                    AppServerLastError = null,
+                    AppServerLastExceptionType = null,
+                    UpdatedAtUtc = DateTimeOffset.UtcNow,
+                };
                 stateStore.Write(state);
                 log.TryAppend("APP_SERVER_INITIALIZED");
 
@@ -166,14 +173,23 @@ public sealed class McpHelperService
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
+                state = CreateAppServerFailureState(
+                    state,
+                    "timed-out",
+                    new OperationCanceledException("The Codex App Server startup timed out."));
+                stateStore.Write(state);
                 log.TryAppend("APP_SERVER_TIMED_OUT");
             }
             catch (CodexAppServerException exception)
             {
+                state = CreateAppServerFailureState(state, "unavailable", exception);
+                stateStore.Write(state);
                 log.AppendException("APP_SERVER_UNAVAILABLE", exception);
             }
             catch (Exception exception)
             {
+                state = CreateAppServerFailureState(state, "failed", exception);
+                stateStore.Write(state);
                 log.AppendException("APP_SERVER_FAILED", exception);
             }
             if (!hostExitedDuringStartup)
@@ -310,6 +326,19 @@ public sealed class McpHelperService
     private sealed class HostChatGptExitedDuringStartupException : Exception
     {
     }
+
+    private static HelperRuntimeState CreateAppServerFailureState(
+        HelperRuntimeState state,
+        string appServerStatus,
+        Exception exception) =>
+        state with
+        {
+            AppServerConnected = false,
+            AppServerStatus = appServerStatus,
+            AppServerLastError = DiagnosticMessageSanitizer.Sanitize(exception.Message),
+            AppServerLastExceptionType = exception.GetType().Name,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+        };
 
     private HelperRuntimeState RefreshTitle(
         HelperRuntimeState state,

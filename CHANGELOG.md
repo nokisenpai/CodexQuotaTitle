@@ -2,6 +2,10 @@
 
 All notable changes to CodexQuotaTitle are documented in this file.
 
+## [0.1.4] - 2026-08-23
+
+- Added safe App Server startup diagnostics to the MCP status response.
+
 ## [0.1.3] - 2026-08-23
 
 - Added MCP tools to locate and open the current profile's settings file.

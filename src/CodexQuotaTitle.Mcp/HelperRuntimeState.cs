@@ -35,6 +35,12 @@ public sealed record HelperRuntimeState(
 
     public bool Enabled { get; init; }
 
+    public string AppServerStatus { get; init; } = "not-started";
+
+    public string? AppServerLastError { get; init; }
+
+    public string? AppServerLastExceptionType { get; init; }
+
     public string? LastRenderedTitle { get; init; }
 
     public string? CustomTitleBaseTitle { get; init; }
