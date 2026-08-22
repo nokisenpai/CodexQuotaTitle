@@ -9,7 +9,7 @@ namespace CodexQuotaTitle.Mcp;
 public sealed class McpStdioServer
 {
     private const string ServerName = "codex_quota_title";
-    private const string ServerVersion = "0.1.0";
+    private const string ServerVersion = "0.1.1";
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web);
     private readonly McpBootstrapLog _bootstrapLog;
     private readonly int _processId;
@@ -246,11 +246,21 @@ public sealed class McpStdioServer
         }
 
         var store = GetSettingsStore();
-        var current = store.LoadOrCreate().Settings;
+        var loadResult = store.LoadOrCreate();
+        if (loadResult.Error is not null)
+        {
+            throw new McpRequestException(-32000, $"Unable to update settings: {loadResult.Error}");
+        }
+
+        var current = loadResult.Settings;
         var updated = current with { Template = template };
         try
         {
-            store.Save(updated);
+            store.UpdateTemplatePreservingJsonc(template);
+        }
+        catch (InvalidDataException exception)
+        {
+            throw new McpRequestException(-32000, $"Unable to update settings: {exception.Message}");
         }
         catch (IOException exception)
         {

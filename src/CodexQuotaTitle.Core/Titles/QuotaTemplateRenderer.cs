@@ -4,9 +4,11 @@ using CodexQuotaTitle.Quotas;
 
 namespace CodexQuotaTitle.Titles;
 
-public sealed record TitleTemplateParts(string BeforeBaseTitle, string AfterBaseTitle)
+public sealed record TitleTemplateParts(string BeforeBaseTitle, string AfterBaseTitle, bool IncludesBaseTitle)
 {
-    public string Render(string baseTitle) => string.Concat(BeforeBaseTitle, baseTitle, AfterBaseTitle);
+    public string Render(string baseTitle) => IncludesBaseTitle
+        ? string.Concat(BeforeBaseTitle, baseTitle, AfterBaseTitle)
+        : BeforeBaseTitle;
 }
 
 public sealed record QuotaTemplateValidationResult(
@@ -21,8 +23,9 @@ public sealed class QuotaTemplateRenderer
     public const string MissingValue = "—";
 
     private static readonly Regex PlaceholderRegex = new("%[a-z0-9_]+%", RegexOptions.Compiled | RegexOptions.CultureInvariant);
-    private static readonly HashSet<string> SupportedPlaceholders = new(StringComparer.Ordinal)
+    public static IReadOnlyList<string> SupportedPlaceholders { get; } = Array.AsReadOnly(new[]
     {
+        BaseTitlePlaceholder,
         "%primary_percent_used%",
         "%primary_percent_remaining%",
         "%primary_reset_date%",
@@ -37,7 +40,9 @@ public sealed class QuotaTemplateRenderer
         "%week_percent_remaining%",
         "%week_reset_date%",
         "%week_reset_relative%",
-    };
+    });
+
+    private static readonly HashSet<string> SupportedPlaceholderSet = new(SupportedPlaceholders, StringComparer.Ordinal);
 
     public TitleTemplateParts RenderParts(
         string template,
@@ -53,8 +58,9 @@ public sealed class QuotaTemplateRenderer
         }
 
         var baseTitleIndex = template.IndexOf(BaseTitlePlaceholder, StringComparison.Ordinal);
-        var before = template[..baseTitleIndex];
-        var after = template[(baseTitleIndex + BaseTitlePlaceholder.Length)..];
+        var includesBaseTitle = baseTitleIndex >= 0;
+        var before = includesBaseTitle ? template[..baseTitleIndex] : template;
+        var after = includesBaseTitle ? template[(baseTitleIndex + BaseTitlePlaceholder.Length)..] : string.Empty;
         var primary = quotas.RateLimits?.Primary;
         var secondary = quotas.RateLimits?.Secondary;
         var fiveHours = QuotaAliasResolver.FindFiveHours(quotas);
@@ -62,7 +68,8 @@ public sealed class QuotaTemplateRenderer
 
         return new TitleTemplateParts(
             RenderFragment(before, primary, secondary, fiveHours, week, dateFormat),
-            RenderFragment(after, primary, secondary, fiveHours, week, dateFormat));
+            RenderFragment(after, primary, secondary, fiveHours, week, dateFormat),
+            includesBaseTitle);
     }
 
     public QuotaTemplateValidationResult Validate(string? template)
@@ -74,17 +81,17 @@ public sealed class QuotaTemplateRenderer
 
         var baseTitleCount = PlaceholderRegex.Matches(template)
             .Count(match => string.Equals(match.Value, BaseTitlePlaceholder, StringComparison.Ordinal));
-        if (baseTitleCount != 1)
+        if (baseTitleCount > 1)
         {
             return new QuotaTemplateValidationResult(
                 false,
                 Array.Empty<string>(),
-                $"A title template must contain exactly one {BaseTitlePlaceholder} placeholder.");
+                $"A title template cannot contain more than one {BaseTitlePlaceholder} placeholder.");
         }
 
         var unknown = PlaceholderRegex.Matches(template)
             .Select(match => match.Value)
-            .Where(value => value != BaseTitlePlaceholder && !SupportedPlaceholders.Contains(value))
+            .Where(value => !SupportedPlaceholderSet.Contains(value))
             .Distinct(StringComparer.Ordinal)
             .ToList();
         return new QuotaTemplateValidationResult(true, unknown, null);

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using CodexQuotaTitle.Profiles;
+using CodexQuotaTitle.Titles;
 
 namespace CodexQuotaTitle.Settings;
 
@@ -73,6 +74,7 @@ public sealed class CodexQuotaTitleSettingsStore
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         PropertyNameCaseInsensitive = true,
+        ReadCommentHandling = JsonCommentHandling.Skip,
         WriteIndented = true,
     };
 
@@ -91,7 +93,7 @@ public sealed class CodexQuotaTitleSettingsStore
         {
             try
             {
-                Save(CodexQuotaTitleSettings.Defaults);
+                SaveDefaultSettings(CodexQuotaTitleSettings.Defaults);
                 return new CodexQuotaTitleSettingsLoadResult(CodexQuotaTitleSettings.Defaults, true, null);
             }
             catch (IOException exception)
@@ -107,7 +109,7 @@ public sealed class CodexQuotaTitleSettingsStore
         try
         {
             var settings = JsonSerializer.Deserialize<CodexQuotaTitleSettings>(File.ReadAllText(_paths.SettingsPath), SerializerOptions);
-            if (settings is null || string.IsNullOrWhiteSpace(settings.Template) || string.IsNullOrWhiteSpace(settings.DateFormat))
+            if (settings is null || !IsValid(settings))
             {
                 return new CodexQuotaTitleSettingsLoadResult(CodexQuotaTitleSettings.Defaults, true, "settings-json-invalid");
             }
@@ -131,11 +133,54 @@ public sealed class CodexQuotaTitleSettingsStore
     public void Save(CodexQuotaTitleSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
+        WriteAtomically(JsonSerializer.Serialize(settings, SerializerOptions));
+    }
+
+    public void UpdateTemplatePreservingJsonc(string template)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(template);
+
+        var contents = File.ReadAllText(_paths.SettingsPath);
+        CodexQuotaTitleSettings? settings;
+        try
+        {
+            settings = JsonSerializer.Deserialize<CodexQuotaTitleSettings>(contents, SerializerOptions);
+        }
+        catch (JsonException)
+        {
+            throw new InvalidDataException("settings-json-invalid");
+        }
+
+        if (!IsValid(settings))
+        {
+            throw new InvalidDataException("settings-json-invalid");
+        }
+
+        WriteAtomically(JsoncTopLevelStringPropertyUpdater.ReplaceStringValue(contents, "template", template));
+    }
+
+    private void SaveDefaultSettings(CodexQuotaTitleSettings settings)
+    {
+        var placeholderComments = string.Join(
+            Environment.NewLine,
+            QuotaTemplateRenderer.SupportedPlaceholders.Select(placeholder => string.Concat("// ", placeholder)));
+        var contents = string.Concat(
+            "// CodexQuotaTitle supported placeholders:",
+            Environment.NewLine,
+            placeholderComments,
+            Environment.NewLine,
+            Environment.NewLine,
+            JsonSerializer.Serialize(settings, SerializerOptions));
+        WriteAtomically(contents);
+    }
+
+    private void WriteAtomically(string contents)
+    {
         Directory.CreateDirectory(_paths.DirectoryPath);
         var temporaryPath = string.Concat(_paths.SettingsPath, ".", Guid.NewGuid().ToString("N"), ".tmp");
         try
         {
-            File.WriteAllText(temporaryPath, JsonSerializer.Serialize(settings, SerializerOptions));
+            File.WriteAllText(temporaryPath, contents);
             File.Move(temporaryPath, _paths.SettingsPath, overwrite: true);
         }
         finally
@@ -146,4 +191,9 @@ public sealed class CodexQuotaTitleSettingsStore
             }
         }
     }
+
+    private static bool IsValid(CodexQuotaTitleSettings? settings) =>
+        settings is not null &&
+        !string.IsNullOrWhiteSpace(settings.Template) &&
+        !string.IsNullOrWhiteSpace(settings.DateFormat);
 }

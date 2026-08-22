@@ -85,6 +85,24 @@ public sealed class TitleOwnership
         return currentTitle.IndexOf(_sentinels.EndMarker, contentStart, StringComparison.Ordinal) >= 0;
     }
 
+    /// <summary>
+    /// Returns true only when one complete owned range is the entire title. This represents a
+    /// fully custom template that intentionally has no Codex base-title content.
+    /// </summary>
+    public bool IsFullyOwnedTitle(string currentTitle)
+    {
+        ArgumentNullException.ThrowIfNull(currentTitle);
+
+        if (!currentTitle.StartsWith(_sentinels.StartMarker, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var contentStart = _sentinels.StartMarker.Length;
+        var end = currentTitle.IndexOf(_sentinels.EndMarker, contentStart, StringComparison.Ordinal);
+        return end >= contentStart && end + _sentinels.EndMarker.Length == currentTitle.Length;
+    }
+
     public string GetVisibleTitle(string title)
     {
         ArgumentNullException.ThrowIfNull(title);
@@ -103,11 +121,33 @@ public sealed class TitleOwnership
         ArgumentNullException.ThrowIfNull(contentBeforeBaseTitle);
         ArgumentNullException.ThrowIfNull(contentAfterBaseTitle);
 
-        var baseTitle = GetBaseTitle(currentTitle);
+        return ApplyToBaseTitle(GetBaseTitle(currentTitle), contentBeforeBaseTitle, contentAfterBaseTitle);
+    }
+
+    /// <summary>
+    /// Applies ownership around an explicit base title. The caller supplies it when transitioning
+    /// back from a fully custom title whose original base is retained by the helper runtime.
+    /// </summary>
+    public string ApplyToBaseTitle(string baseTitle, string contentBeforeBaseTitle, string contentAfterBaseTitle)
+    {
+        ArgumentNullException.ThrowIfNull(baseTitle);
+        ArgumentNullException.ThrowIfNull(contentBeforeBaseTitle);
+        ArgumentNullException.ThrowIfNull(contentAfterBaseTitle);
+
         return string.Concat(
             WrapOwnedContent(contentBeforeBaseTitle),
             baseTitle,
             WrapOwnedContent(contentAfterBaseTitle));
+    }
+
+    /// <summary>
+    /// Wraps a complete, user-visible title in one owned range. There is intentionally no visible
+    /// base-title content in this form.
+    /// </summary>
+    public string ApplyFullyOwnedTitle(string visibleTitle)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(visibleTitle);
+        return WrapOwnedContent(visibleTitle);
     }
 
     private string WrapOwnedContent(string content) =>

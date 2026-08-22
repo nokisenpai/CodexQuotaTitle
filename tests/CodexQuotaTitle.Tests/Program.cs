@@ -13,13 +13,22 @@ var tests = new (string Name, Action Execute)[]
 {
     ("Template renders duration-based 5h and week aliases", TemplateRendersDurationAliases),
     ("Template supports content before base title", TemplateSupportsPrefix),
-    ("Template requires exactly one base title placeholder", TemplateRequiresOneBaseTitle),
+    ("Template accepts zero or one base title placeholder", TemplateAcceptsOptionalBaseTitle),
+    ("Template rejects repeated base title placeholders", TemplateRejectsRepeatedBaseTitle),
+    ("Template renders a fully custom title", TemplateRendersFullyCustomTitle),
     ("Template preserves unknown placeholders with diagnostics", TemplatePreservesUnknownPlaceholder),
     ("Template supports primary and secondary placeholders", TemplateSupportsPrimaryAndSecondaryPlaceholders),
     ("Template renders missing quota values as em dashes", TemplateRendersMissingValuesAsEmDashes),
     ("Settings create profile defaults atomically", SettingsCreateProfileDefaultsAtomically),
     ("Settings persist template changes per profile", SettingsPersistTemplateChangesPerProfile),
+    ("Settings accept line and block comments", SettingsReadJsonWithComments),
     ("Invalid settings JSON keeps the user file intact", SettingsInvalidJsonKeepsUserFile),
+    ("MCP set template preserves generated JSONC header comments", () => McpSetTemplatePreservesGeneratedHeaderComments().GetAwaiter().GetResult()),
+    ("MCP set template preserves arbitrary user comments", () => McpSetTemplatePreservesArbitraryUserComments().GetAwaiter().GetResult()),
+    ("MCP set template preserves other settings properties", () => McpSetTemplatePreservesOtherSettingsProperties().GetAwaiter().GetResult()),
+    ("MCP set template escapes quotes and Unicode", () => McpSetTemplateEscapesQuotesAndUnicode().GetAwaiter().GetResult()),
+    ("MCP set template creates commented settings when absent", () => McpSetTemplateCreatesCommentedSettingsWhenAbsent().GetAwaiter().GetResult()),
+    ("MCP set template keeps invalid settings intact", () => McpSetTemplateKeepsInvalidSettingsIntact().GetAwaiter().GetResult()),
     ("Title ownership removes only owned ranges", TitleOwnershipRemovesOnlyOwnedRanges),
     ("Title ownership keeps a replacement title as the base", TitleOwnershipAcceptsReplacementTitle),
     ("Title ownership leaves incomplete markers intact", TitleOwnershipKeepsIncompleteMarker),
@@ -43,6 +52,7 @@ var tests = new (string Name, Action Execute)[]
     ("MCP starts one helper per profile and forwards host hints", McpBootstrapperStartsOneHelperPerProfile),
     ("MCP can start distinct helpers for distinct profiles", McpBootstrapperAllowsDistinctProfiles),
     ("Helper uses the host PID, CODEX_HOME, and exits with the host", () => McpHelperServiceUsesBootstrapHintsAndHostLifecycle().GetAwaiter().GetResult()),
+    ("Helper cleanup restores the base after a fully custom title", () => McpHelperCleanupRestoresBaseAfterFullyCustomTitle().GetAwaiter().GetResult()),
     ("Helper refreshes after a quota notification", () => McpHelperRefreshesAfterQuotaNotification().GetAwaiter().GetResult()),
     ("Helper performs a periodic quota fallback refresh", () => McpHelperPerformsPeriodicQuotaFallback().GetAwaiter().GetResult()),
     ("MCP stdio server completes the bootstrap handshake and status call", () => McpStdioServerCompletesBootstrapHandshake().GetAwaiter().GetResult()),
@@ -56,6 +66,10 @@ var tests = new (string Name, Action Execute)[]
     ("Automatic refresh does not duplicate owned content", AutomaticRefreshDoesNotDuplicateOwnedContent),
     ("Disabled settings clean only owned content", AutomaticRefreshDisabledCleansOwnedContent),
     ("Lost ownership prevents destructive cleanup", AutomaticRefreshOwnershipLostPreventsWrite),
+    ("Automatic refresh transitions between base and custom templates", AutomaticRefreshTransitionsBetweenBaseAndCustomTemplates),
+    ("Fully custom titles do not duplicate ownership on refresh", FullyCustomTitleDoesNotDuplicateOwnership),
+    ("Disabled settings clean a fully custom title", FullyCustomTitleDisabledCleansToCapturedBaseTitle),
+    ("Fully custom title cleanup preserves lost ownership", FullyCustomTitleOwnershipLossPreventsCleanup),
 };
 
 var failures = new List<string>();
@@ -108,8 +122,29 @@ static void TemplateSupportsPrefix()
     AssertEqual("75% • Codex", parts.Render("Codex"));
 }
 
-static void TemplateRequiresOneBaseTitle() =>
-    AssertThrows<FormatException>(() => new QuotaTemplateRenderer().RenderParts("%week_percent_remaining%", CreateQuotas(null, null)));
+static void TemplateAcceptsOptionalBaseTitle()
+{
+    var renderer = new QuotaTemplateRenderer();
+
+    AssertTrue(renderer.Validate("%week_percent_remaining%").IsValid, "A template without a base title was rejected.");
+    AssertTrue(renderer.Validate("%base_title% | %week_percent_remaining%").IsValid, "A template with one base title was rejected.");
+}
+
+static void TemplateRejectsRepeatedBaseTitle() =>
+    AssertThrows<FormatException>(() => new QuotaTemplateRenderer().RenderParts("%base_title% | %base_title%", CreateQuotas(null, null)));
+
+static void TemplateRendersFullyCustomTitle()
+{
+    var resetAt = new DateTimeOffset(2026, 8, 29, 18, 26, 0, TimeSpan.FromHours(2));
+    var parts = new QuotaTemplateRenderer().RenderParts(
+        "Codex1 • %week_percent_remaining% • %week_reset_date%",
+        CreateQuotas(null, new RateLimitWindow(22m, 10080, resetAt)));
+
+    AssertTrue(!parts.IncludesBaseTitle, "A fully custom template was marked as using the base title.");
+    AssertEqual(
+        string.Concat("Codex1 • 78% • ", resetAt.ToLocalTime().ToString("dd'/'MM HH:mm")),
+        parts.Render("Codex - Example Project"));
+}
 
 static void TemplatePreservesUnknownPlaceholder()
 {
@@ -177,6 +212,181 @@ static void SettingsInvalidJsonKeepsUserFile()
     AssertTrue(result.UsedDefaults, "Invalid JSON did not fall back to defaults.");
     AssertEqual("settings-json-invalid", result.Error!);
     AssertEqual(invalidJson, File.ReadAllText(fixture.Store.Paths.SettingsPath));
+}
+
+static void SettingsReadJsonWithComments()
+{
+    using var fixture = new SettingsFixture();
+    Directory.CreateDirectory(fixture.Store.Paths.DirectoryPath);
+    const string settingsJson = """
+        // A fully custom Codex title is allowed.
+        {
+          /* The weekly quota is displayed first. */
+          "template": "Codex1 • %week_percent_remaining% • %week_reset_date%",
+          "dateFormat": "dd/MM HH:mm",
+          "enabled": true
+        }
+        """;
+    File.WriteAllText(fixture.Store.Paths.SettingsPath, settingsJson);
+
+    var result = fixture.Store.LoadOrCreate();
+
+    AssertTrue(!result.UsedDefaults, "Commented settings unexpectedly fell back to defaults.");
+    AssertTrue(result.Error is null, "Commented settings unexpectedly reported an error.");
+    AssertEqual("Codex1 • %week_percent_remaining% • %week_reset_date%", result.Settings.Template);
+    AssertEqual("dd/MM HH:mm", result.Settings.DateFormat);
+    AssertTrue(result.Settings.Enabled, "The commented enabled setting was not loaded.");
+}
+
+static async Task McpSetTemplatePreservesGeneratedHeaderComments()
+{
+    using var fixture = new SettingsFixture();
+    fixture.Store.LoadOrCreate();
+
+    const string template = "Codex1 • %week_percent_remaining%";
+    using var response = await CallMcpSetTemplateAsync(fixture, template);
+    var contents = File.ReadAllText(fixture.Store.Paths.SettingsPath);
+
+    AssertMcpSetTemplateSucceeded(response, template);
+    AssertContains(contents, "// CodexQuotaTitle supported placeholders:");
+    AssertContains(contents, "// %base_title%");
+    AssertContains(contents, "// %week_percent_remaining%");
+}
+
+static async Task McpSetTemplatePreservesArbitraryUserComments()
+{
+    using var fixture = new SettingsFixture();
+    WriteSettings(fixture, """
+        // Keep this heading.
+        {
+          "template": "%base_title%", // Keep this inline note.
+          /* Keep this user comment. */
+          "dateFormat": "dd/MM HH:mm",
+          "enabled": true
+        }
+        """);
+
+    using var response = await CallMcpSetTemplateAsync(fixture, "W %week_percent_remaining%");
+    var contents = File.ReadAllText(fixture.Store.Paths.SettingsPath);
+
+    AssertMcpSetTemplateSucceeded(response, "W %week_percent_remaining%");
+    AssertContains(contents, "// Keep this heading.");
+    AssertContains(contents, "// Keep this inline note.");
+    AssertContains(contents, "/* Keep this user comment. */");
+}
+
+static async Task McpSetTemplatePreservesOtherSettingsProperties()
+{
+    using var fixture = new SettingsFixture();
+    WriteSettings(fixture, """
+        {
+          "template": "%base_title%",
+          "dateFormat": "yyyy-MM-dd HH:mm",
+          "enabled": false
+        }
+        """);
+
+    using var response = await CallMcpSetTemplateAsync(fixture, "Codex1 • %week_percent_remaining%");
+    var contents = File.ReadAllText(fixture.Store.Paths.SettingsPath);
+    var loaded = fixture.Store.LoadOrCreate().Settings;
+
+    AssertMcpSetTemplateSucceeded(response, "Codex1 • %week_percent_remaining%");
+    AssertEqual("yyyy-MM-dd HH:mm", loaded.DateFormat);
+    AssertTrue(!loaded.Enabled, "The set-template operation changed enabled.");
+    AssertTrue(
+        contents.IndexOf("\"template\"", StringComparison.Ordinal) < contents.IndexOf("\"dateFormat\"", StringComparison.Ordinal) &&
+        contents.IndexOf("\"dateFormat\"", StringComparison.Ordinal) < contents.IndexOf("\"enabled\"", StringComparison.Ordinal),
+        "The set-template operation changed the top-level property order.");
+}
+
+static async Task McpSetTemplateEscapesQuotesAndUnicode()
+{
+    using var fixture = new SettingsFixture();
+    fixture.Store.LoadOrCreate();
+    const string template = "Codex \"Café\" • ☃ %week_percent_remaining%";
+
+    using var response = await CallMcpSetTemplateAsync(fixture, template);
+    var contents = File.ReadAllText(fixture.Store.Paths.SettingsPath);
+    var loaded = fixture.Store.LoadOrCreate().Settings;
+
+    AssertMcpSetTemplateSucceeded(response, template);
+    AssertEqual(template, loaded.Template);
+    AssertTrue(contents.Contains("\\", StringComparison.Ordinal), "The updated JSONC string did not escape its embedded quotes.");
+}
+
+static async Task McpSetTemplateCreatesCommentedSettingsWhenAbsent()
+{
+    using var fixture = new SettingsFixture();
+    const string template = "Codex1 • %week_percent_remaining%";
+    AssertTrue(!File.Exists(fixture.Store.Paths.SettingsPath), "The test settings file already exists.");
+
+    using var response = await CallMcpSetTemplateAsync(fixture, template);
+    var contents = File.ReadAllText(fixture.Store.Paths.SettingsPath);
+    var loaded = fixture.Store.LoadOrCreate().Settings;
+
+    AssertMcpSetTemplateSucceeded(response, template);
+    AssertContains(contents, "// CodexQuotaTitle supported placeholders:");
+    AssertEqual(template, loaded.Template);
+    AssertEqual(CodexQuotaTitleSettings.DefaultDateFormat, loaded.DateFormat);
+    AssertTrue(loaded.Enabled, "Default enabled was not preserved when settings were created.");
+}
+
+static async Task McpSetTemplateKeepsInvalidSettingsIntact()
+{
+    using var fixture = new SettingsFixture();
+    const string invalidSettings = "{ invalid settings";
+    WriteSettings(fixture, invalidSettings);
+
+    using var response = await CallMcpSetTemplateAsync(fixture, "Codex1 • %week_percent_remaining%");
+    var error = response.RootElement.GetProperty("error");
+
+    AssertTrue(error.GetProperty("code").GetInt32() == -32000, "Invalid settings did not produce an MCP storage error.");
+    AssertContains(error.GetProperty("message").GetString()!, "settings-json-invalid");
+    AssertEqual(invalidSettings, File.ReadAllText(fixture.Store.Paths.SettingsPath));
+}
+
+static async Task<JsonDocument> CallMcpSetTemplateAsync(SettingsFixture fixture, string template)
+{
+    var startupContext = new McpStartupContext(fixture.Profile.RawCodexHome, fixture.Profile);
+    var bootstrapper = new McpHelperBootstrapper(
+        new McpBootstrapLog(Path.Combine(fixture.Store.Paths.DirectoryPath, "mcp-bootstrap")),
+        startupContext,
+        new McpProcessTree(null, Array.Empty<McpProcessNode>()));
+    var server = new McpStdioServer(
+        new McpBootstrapLog(Path.Combine(fixture.Store.Paths.DirectoryPath, "mcp-server")),
+        Environment.ProcessId,
+        startupContext,
+        bootstrapper,
+        new TestSettingsStoreFactory(fixture.Store));
+    var request = JsonSerializer.Serialize(new
+    {
+        jsonrpc = "2.0",
+        id = 1,
+        method = "tools/call",
+        @params = new
+        {
+            name = "codex_quota_title_set_template",
+            arguments = new { template },
+        },
+    });
+    using var input = new StringReader(request);
+    using var output = new StringWriter();
+
+    await server.RunAsync(input, output);
+    return JsonDocument.Parse(output.ToString());
+}
+
+static void AssertMcpSetTemplateSucceeded(JsonDocument response, string expectedTemplate)
+{
+    var settings = response.RootElement.GetProperty("result").GetProperty("structuredContent");
+    AssertEqual(expectedTemplate, settings.GetProperty("template").GetString()!);
+    AssertTrue(settings.GetProperty("helperRefreshRequested").GetBoolean(), "The set-template operation did not request a helper refresh.");
+}
+
+static void WriteSettings(SettingsFixture fixture, string contents)
+{
+    Directory.CreateDirectory(fixture.Store.Paths.DirectoryPath);
+    File.WriteAllText(fixture.Store.Paths.SettingsPath, contents);
 }
 
 static void TitleOwnershipRemovesOnlyOwnedRanges()
@@ -566,6 +776,43 @@ static async Task McpHelperServiceUsesBootstrapHintsAndHostLifecycle()
     }
 }
 
+static async Task McpHelperCleanupRestoresBaseAfterFullyCustomTitle()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-custom-cleanup-tests", Guid.NewGuid().ToString("N")));
+    var runtimePaths = new HelperRuntimePaths(Path.Combine(Path.GetTempPath(), "cqt-custom-cleanup-tests", Guid.NewGuid().ToString("N")));
+    try
+    {
+        var factory = new TestAppServerSessionFactory();
+        var hostLifetime = new TestHostProcessLifetime();
+        var ownership = new TitleOwnership(new TestSentinels());
+        var titleWindow = new TestTitleWriteWindow(333, "Codex - Example Project");
+        var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(new LocalAppDataSettingsPathResolver(Path.Combine(runtimePaths.DirectoryPath, "settings")));
+        settingsFactory.Create(profile).Save(CodexQuotaTitleSettings.Defaults with
+        {
+            Template = "Codex1 • %week_percent_remaining% • %week_reset_date%",
+        });
+        var service = new McpHelperService(
+            factory,
+            hostLifetime,
+            new TestSingleWindowHostProvider(titleWindow),
+            settingsFactory,
+            new TestSettingsChangeWatcherFactory(),
+            new AutomaticTitleUpdateService(titleWindow, ownership));
+
+        var run = service.RunAsync(new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths));
+        await factory.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => ownership.IsFullyOwnedTitle(titleWindow.Title), TimeSpan.FromSeconds(2));
+
+        hostLifetime.Complete();
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+        AssertEqual("Codex - Example Project", titleWindow.Title);
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
 static async Task McpHelperRefreshesAfterQuotaNotification()
 {
     var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-notification-tests", Guid.NewGuid().ToString("N")));
@@ -639,9 +886,10 @@ static async Task McpStdioServerCompletesBootstrapHandshake()
 {
     using var fixture = new McpProcessFixture();
     var codexHome = Path.Combine(fixture.DirectoryPath, "codex-home");
-    Directory.CreateDirectory(codexHome);
     var packagePath = Path.Combine(FindRepositoryRoot(), "plugins", "codex-quota-title", "bin", "mcp", "win-x64", "CodexQuotaTitle.Mcp.exe");
+    var bootstrapLogPath = Path.Combine(Path.GetTempPath(), "CodexQuotaTitle", "mcp-bootstrap.log");
     AssertTrue(File.Exists(packagePath), "The self-contained MCP executable was not published to the plugin package.");
+    Directory.CreateDirectory(codexHome);
 
     var startInfo = new ProcessStartInfo
     {
@@ -650,10 +898,8 @@ static async Task McpStdioServerCompletesBootstrapHandshake()
         RedirectStandardInput = true,
         RedirectStandardOutput = true,
         RedirectStandardError = true,
-        WorkingDirectory = fixture.DirectoryPath,
+        WorkingDirectory = FindRepositoryRoot(),
     };
-    startInfo.Environment["TEMP"] = fixture.DirectoryPath;
-    startInfo.Environment["TMP"] = fixture.DirectoryPath;
     startInfo.Environment["LOCALAPPDATA"] = fixture.DirectoryPath;
     startInfo.Environment["CODEXQUOTATITLE_SETTINGS_ROOT"] = fixture.DirectoryPath;
     startInfo.Environment["CODEX_HOME"] = codexHome;
@@ -667,7 +913,6 @@ static async Task McpStdioServerCompletesBootstrapHandshake()
         AssertEqual("2025-03-26", initializeResponse.RootElement.GetProperty("result").GetProperty("protocolVersion").GetString()!);
     }
 
-    await WriteJsonAsync(process, """{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}""");
     await WriteJsonAsync(process, """{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}""");
     using (var toolsResponse = await ReadResponseAsync(process))
     {
@@ -695,21 +940,15 @@ static async Task McpStdioServerCompletesBootstrapHandshake()
         AssertTrue(settings.GetProperty("enabled").GetBoolean(), "Default settings are not enabled.");
     }
 
-    await WriteJsonAsync(process, """{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"codex_quota_title_set_template","arguments":{"template":"W %week_percent_remaining% | %base_title%"}}}""");
-    using (var setTemplateResponse = await ReadResponseAsync(process))
-    {
-        var settings = setTemplateResponse.RootElement.GetProperty("result").GetProperty("structuredContent");
-        AssertEqual("W %week_percent_remaining% | %base_title%", settings.GetProperty("template").GetString()!);
-        AssertTrue(settings.GetProperty("helperRefreshRequested").GetBoolean(), "The settings tool did not request a helper refresh.");
-    }
-
     await process.StandardInput.DisposeAsync();
     await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
     var standardError = await process.StandardError.ReadToEndAsync();
     AssertTrue(process.ExitCode == 0, $"The MCP server exited with {process.ExitCode}: {standardError}");
     AssertEqual(string.Empty, standardError);
 
-    var bootstrapContents = File.ReadAllText(fixture.BootstrapLogPath);
+    var bootstrapContents = string.Join(
+        Environment.NewLine,
+        File.ReadLines(bootstrapLogPath).Where(line => line.Contains($"PID={process.Id} ", StringComparison.Ordinal)));
     AssertContains(bootstrapContents, "MCP_PROCESS_ENTERED");
     AssertContains(bootstrapContents, "MCP_PROCESS_CHAIN=");
     AssertContains(bootstrapContents, $"CODEX_HOME_PRESENT=TRUE CODEX_HOME_VALUE={codexHome}");
@@ -718,11 +957,9 @@ static async Task McpStdioServerCompletesBootstrapHandshake()
     AssertContains(bootstrapContents, $"PROFILE_IDENTITY={ProfileIdentity.Create(codexHome).ProfileHash}");
     AssertContains(bootstrapContents, "PLUGIN_ROOT_PRESENT=FALSE");
     AssertContains(bootstrapContents, "PLUGIN_DATA_PRESENT=FALSE");
-    AssertContains(bootstrapContents, "MCP_INITIALIZED");
     AssertContains(bootstrapContents, "MCP_TOOLS_LIST");
     AssertContains(bootstrapContents, "MCP_STATUS_TOOL_CALLED");
     AssertContains(bootstrapContents, "MCP_GET_SETTINGS_TOOL_CALLED");
-    AssertContains(bootstrapContents, "MCP_SET_TEMPLATE_TOOL_CALLED");
 }
 
 static string FindRepositoryRoot()
@@ -944,15 +1181,109 @@ static void AutomaticRefreshOwnershipLostPreventsWrite()
     AssertTrue(window.SetCallCount == setCallsBeforeLoss, "Cleanup modified a title it no longer owned.");
 }
 
-static AutomaticTitleUpdateRequest CreateAutomaticTitleRequest(TestTitleWriteWindow window, bool enabled) =>
+static void AutomaticRefreshTransitionsBetweenBaseAndCustomTemplates()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var ownership = new TitleOwnership(new TestSentinels());
+    var window = new TestTitleWriteWindow(Environment.ProcessId, "Codex - Example Project");
+    var service = new AutomaticTitleUpdateService(window, ownership);
+    var withBase = service.Apply(CreateAutomaticTitleRequest(window, true));
+    AssertTrue(withBase.Success, "The base-title template was not applied.");
+
+    const string customTemplate = "Codex1 • %week_percent_remaining% • %week_reset_date%";
+    var withoutBase = service.Apply(CreateAutomaticTitleRequest(window, true, customTemplate, withBase.CustomTitleBaseTitle));
+    AssertTrue(withoutBase.Success, "The custom-title template was not applied.");
+    AssertEqual("Codex1 • 100% • 29/08 18:26", withoutBase.RenderedTitle!);
+    AssertEqual("Codex - Example Project", withoutBase.CustomTitleBaseTitle!);
+    AssertTrue(ownership.IsFullyOwnedTitle(window.Title), "The custom title was not represented as one owned range.");
+
+    var restoredBase = service.Apply(CreateAutomaticTitleRequest(window, true, CodexQuotaTitleSettings.DefaultTemplate, withoutBase.CustomTitleBaseTitle));
+    AssertTrue(restoredBase.Success, "The base-title template was not restored from a custom title.");
+    AssertEqual("Codex - Example Project | W 100% • 29/08 18:26", restoredBase.RenderedTitle!);
+    AssertEqual("Codex - Example Project", ownership.GetBaseTitle(window.Title));
+}
+
+static void FullyCustomTitleDoesNotDuplicateOwnership()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var ownership = new TitleOwnership(new TestSentinels());
+    var window = new TestTitleWriteWindow(Environment.ProcessId, "Codex - Example Project");
+    var service = new AutomaticTitleUpdateService(window, ownership);
+    const string customTemplate = "Codex1 • %week_percent_remaining% • %week_reset_date%";
+
+    var first = service.Apply(CreateAutomaticTitleRequest(window, true, customTemplate));
+    var second = service.Apply(CreateAutomaticTitleRequest(window, true, customTemplate, first.CustomTitleBaseTitle));
+
+    AssertTrue(first.Success && second.Success, "A fully custom title refresh failed.");
+    AssertTrue(ownership.IsFullyOwnedTitle(window.Title), "The repeated custom refresh created multiple ownership zones.");
+    AssertTrue(CountOccurrences(window.Title, "[start]") == 1, "The repeated custom refresh duplicated the ownership marker.");
+    AssertEqual("Codex1 • 100% • 29/08 18:26", second.RenderedTitle!);
+}
+
+static void FullyCustomTitleDisabledCleansToCapturedBaseTitle()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var ownership = new TitleOwnership(new TestSentinels());
+    var window = new TestTitleWriteWindow(Environment.ProcessId, "Codex - Example Project");
+    var service = new AutomaticTitleUpdateService(window, ownership);
+    const string customTemplate = "Codex1 • %week_percent_remaining% • %week_reset_date%";
+
+    var applied = service.Apply(CreateAutomaticTitleRequest(window, true, customTemplate));
+    var cleanup = service.Apply(CreateAutomaticTitleRequest(window, false, customTemplate, applied.CustomTitleBaseTitle));
+
+    AssertTrue(applied.Success, "The fully custom title was not applied.");
+    AssertTrue(cleanup.Cleaned, "Disabled settings did not clean the fully custom title.");
+    AssertEqual("Codex - Example Project", window.Title);
+}
+
+static void FullyCustomTitleOwnershipLossPreventsCleanup()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var ownership = new TitleOwnership(new TestSentinels());
+    var window = new TestTitleWriteWindow(Environment.ProcessId, "Codex - Example Project");
+    var service = new AutomaticTitleUpdateService(window, ownership);
+    const string customTemplate = "Codex1 • %week_percent_remaining% • %week_reset_date%";
+
+    var applied = service.Apply(CreateAutomaticTitleRequest(window, true, customTemplate));
+    var setCallsBeforeLoss = window.SetCallCount;
+    window.Title = "Externally replaced title";
+    var cleanup = service.Apply(CreateAutomaticTitleRequest(window, false, customTemplate, applied.CustomTitleBaseTitle));
+
+    AssertTrue(!cleanup.Changed, "Cleanup wrote after fully custom title ownership was lost.");
+    AssertEqual("Externally replaced title", window.Title);
+    AssertTrue(window.SetCallCount == setCallsBeforeLoss, "Cleanup modified a fully custom title it no longer owned.");
+}
+
+static AutomaticTitleUpdateRequest CreateAutomaticTitleRequest(
+    TestTitleWriteWindow window,
+    bool enabled,
+    string? template = null,
+    string? customTitleBaseTitle = null) =>
     new(
         Environment.ProcessId,
         AutomaticTitleUpdateService.UnambiguousCorrelation,
         [new WindowCandidate(window.Handle, window.ProcessId, "ChatGPT.exe", AutomaticTitleUpdateService.ExpectedWindowClassName, window.Title, true, Array.Empty<CodexQuotaTitle.Processes.InspectedProcess>(), Array.Empty<int>())],
         enabled,
-        CodexQuotaTitleSettings.DefaultTemplate,
+        template ?? CodexQuotaTitleSettings.DefaultTemplate,
         CodexQuotaTitleSettings.DefaultDateFormat,
-        CreateQuotas(null, new RateLimitWindow(0m, 10080, new DateTimeOffset(2026, 8, 29, 18, 26, 0, TimeSpan.FromHours(2)))));
+        CreateQuotas(null, new RateLimitWindow(0m, 10080, new DateTimeOffset(2026, 8, 29, 18, 26, 0, TimeSpan.FromHours(2)))),
+        customTitleBaseTitle);
 
 static int CountOccurrences(string value, string pattern)
 {
@@ -1050,9 +1381,11 @@ file sealed class SettingsFixture : IDisposable
 
     public SettingsFixture()
     {
-        var profile = ProfileIdentity.Create(Path.Combine(_rootDirectory, "profile"));
-        Store = new CodexQuotaTitleSettingsStore(new LocalAppDataSettingsPathResolver(_rootDirectory).GetPaths(profile));
+        Profile = ProfileIdentity.Create(Path.Combine(_rootDirectory, "profile"));
+        Store = new CodexQuotaTitleSettingsStore(new LocalAppDataSettingsPathResolver(_rootDirectory).GetPaths(Profile));
     }
+
+    public ProfileIdentity Profile { get; }
 
     public CodexQuotaTitleSettingsStore Store { get; }
 
@@ -1063,6 +1396,18 @@ file sealed class SettingsFixture : IDisposable
             Directory.Delete(_rootDirectory, recursive: true);
         }
     }
+}
+
+file sealed class TestSettingsStoreFactory : ICodexQuotaTitleSettingsStoreFactory
+{
+    private readonly CodexQuotaTitleSettingsStore _store;
+
+    public TestSettingsStoreFactory(CodexQuotaTitleSettingsStore store)
+    {
+        _store = store;
+    }
+
+    public CodexQuotaTitleSettingsStore Create(ProfileIdentity profile) => _store;
 }
 
 file sealed class EnvironmentVariableScope : IDisposable
@@ -1094,15 +1439,15 @@ file sealed class McpProcessFixture : IDisposable
 
     public void Dispose()
     {
-        for (var attempt = 0; attempt < 20 && Directory.Exists(DirectoryPath); attempt++)
+        for (var attempt = 0; attempt < 50 && Directory.Exists(DirectoryPath); attempt++)
         {
             try
             {
                 Directory.Delete(DirectoryPath, recursive: true);
             }
-            catch (IOException) when (attempt < 19)
+            catch (IOException) when (attempt < 49)
             {
-                Thread.Sleep(50);
+                Thread.Sleep(100);
             }
         }
     }
@@ -1247,6 +1592,29 @@ file sealed class TestHostWindowProvider : IHostWindowProvider
                 Array.Empty<int>()),
         ];
     }
+}
+
+file sealed class TestSingleWindowHostProvider : IHostWindowProvider
+{
+    private readonly TestTitleWriteWindow _window;
+
+    public TestSingleWindowHostProvider(TestTitleWriteWindow window)
+    {
+        _window = window;
+    }
+
+    public IReadOnlyList<WindowCandidate> ListTopLevelWindowsForProcess(int processId) =>
+    [
+        new WindowCandidate(
+            _window.Handle,
+            (uint)processId,
+            "ChatGPT.exe",
+            AutomaticTitleUpdateService.ExpectedWindowClassName,
+            _window.Title,
+            true,
+            Array.Empty<CodexQuotaTitle.Processes.InspectedProcess>(),
+            Array.Empty<int>()),
+    ];
 }
 
 file sealed class TestSettingsChangeWatcherFactory : ISettingsChangeWatcherFactory

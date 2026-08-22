@@ -40,7 +40,7 @@ The default template is:
 %base_title% | W %week_percent_remaining% • %week_reset_date%
 ```
 
-`%base_title%` is required exactly once. The renderer supports these quota placeholders:
+`%base_title%` is the original Codex window title. This placeholder is optional; when omitted, the template becomes the complete visible window title. It can appear at most once. The renderer supports these quota placeholders:
 
 - `%primary_percent_used%`, `%primary_percent_remaining%`, `%primary_reset_date%`
 - `%secondary_percent_used%`, `%secondary_percent_remaining%`, `%secondary_reset_date%`
@@ -54,7 +54,7 @@ Examples:
 ```text
 W %week_percent_remaining% | %base_title%
 %base_title% | 5h %5h_percent_remaining% (%5h_reset_relative%)
-%base_title% | Week %week_percent_used% used
+Codex1 • %week_percent_remaining% • %week_reset_date%
 ```
 
 ## Configuration

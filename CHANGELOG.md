@@ -2,6 +2,10 @@
 
 All notable changes to CodexQuotaTitle are documented in this file.
 
+## [0.1.1] - 2026-08-22
+
+- `%base_title%` is now optional, allowing fully custom window titles.
+
 ## [0.1.0] - 2026-08-22
 
 - First public release.

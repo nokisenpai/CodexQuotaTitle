@@ -51,7 +51,8 @@ public sealed record AutomaticTitleUpdateRequest(
     bool Enabled,
     string Template,
     string DateFormat,
-    QuotaReadResult Quotas);
+    QuotaReadResult Quotas,
+    string? CustomTitleBaseTitle = null);
 
 public sealed record AutomaticTitleUpdateResult(
     bool Success,
@@ -61,7 +62,8 @@ public sealed record AutomaticTitleUpdateResult(
     string Correlation,
     int CandidateCount,
     string? RenderedTitle,
-    string? FailureReason);
+    string? FailureReason,
+    string? CustomTitleBaseTitle = null);
 
 public interface IAutomaticTitleUpdateService
 {
@@ -115,7 +117,7 @@ public sealed class AutomaticTitleUpdateService : IAutomaticTitleUpdateService
         var currentTitle = _windowAccessor.GetWindowTitle(target.Handle);
         if (!request.Enabled)
         {
-            return Cleanup(target, currentTitle, targets.Count);
+            return Cleanup(target, currentTitle, targets.Count, request.CustomTitleBaseTitle);
         }
 
         TitleTemplateParts parts;
@@ -128,9 +130,11 @@ public sealed class AutomaticTitleUpdateService : IAutomaticTitleUpdateService
             return Reject("template-invalid", targets.Count);
         }
 
-        var baseTitle = _ownership.GetBaseTitle(currentTitle);
+        var baseTitle = ResolveBaseTitle(currentTitle, request.CustomTitleBaseTitle);
         var visibleTitle = parts.Render(baseTitle);
-        var ownedTitle = _ownership.Apply(currentTitle, parts.BeforeBaseTitle, parts.AfterBaseTitle);
+        var ownedTitle = parts.IncludesBaseTitle
+            ? _ownership.ApplyToBaseTitle(baseTitle, parts.BeforeBaseTitle, parts.AfterBaseTitle)
+            : _ownership.ApplyFullyOwnedTitle(visibleTitle);
         if (!_windowAccessor.SetWindowTitle(target.Handle, ownedTitle, out var error))
         {
             return Reject(string.Concat("set-window-text-failed-", error.ToString(CultureInfo.InvariantCulture)), targets.Count);
@@ -139,20 +143,37 @@ public sealed class AutomaticTitleUpdateService : IAutomaticTitleUpdateService
         var readBack = _windowAccessor.GetWindowTitle(target.Handle);
         var verified = _ownership.HasCompleteOwnedRange(readBack) &&
             string.Equals(_ownership.GetVisibleTitle(readBack), visibleTitle, StringComparison.Ordinal) &&
-            string.Equals(_ownership.GetBaseTitle(readBack), baseTitle, StringComparison.Ordinal);
+            (parts.IncludesBaseTitle
+                ? string.Equals(_ownership.GetBaseTitle(readBack), baseTitle, StringComparison.Ordinal)
+                : _ownership.IsFullyOwnedTitle(readBack));
         return verified
-            ? new AutomaticTitleUpdateResult(true, true, false, false, UnambiguousCorrelation, targets.Count, visibleTitle, null)
+            ? new AutomaticTitleUpdateResult(
+                true,
+                true,
+                false,
+                false,
+                UnambiguousCorrelation,
+                targets.Count,
+                visibleTitle,
+                null,
+                parts.IncludesBaseTitle ? null : baseTitle)
             : Reject("set-window-text-roundtrip-failed", targets.Count);
     }
 
-    private AutomaticTitleUpdateResult Cleanup(WindowCandidate target, string currentTitle, int candidateCount)
+    private AutomaticTitleUpdateResult Cleanup(
+        WindowCandidate target,
+        string currentTitle,
+        int candidateCount,
+        string? customTitleBaseTitle)
     {
         if (!_ownership.HasCompleteOwnedRange(currentTitle))
         {
             return new AutomaticTitleUpdateResult(true, false, false, false, UnambiguousCorrelation, candidateCount, null, "no-owned-title-content");
         }
 
-        var cleanedTitle = _ownership.GetBaseTitle(currentTitle);
+        var cleanedTitle = _ownership.IsFullyOwnedTitle(currentTitle)
+            ? customTitleBaseTitle ?? _ownership.GetVisibleTitle(currentTitle)
+            : _ownership.GetBaseTitle(currentTitle);
         if (!_windowAccessor.SetWindowTitle(target.Handle, cleanedTitle, out var error))
         {
             return Reject(string.Concat("cleanup-set-window-text-failed-", error.ToString(CultureInfo.InvariantCulture)), candidateCount);
@@ -163,6 +184,11 @@ public sealed class AutomaticTitleUpdateService : IAutomaticTitleUpdateService
             ? new AutomaticTitleUpdateResult(true, true, true, false, UnambiguousCorrelation, candidateCount, null, null)
             : Reject("cleanup-roundtrip-failed", candidateCount);
     }
+
+    private string ResolveBaseTitle(string currentTitle, string? customTitleBaseTitle) =>
+        _ownership.IsFullyOwnedTitle(currentTitle)
+            ? customTitleBaseTitle ?? _ownership.GetVisibleTitle(currentTitle)
+            : _ownership.GetBaseTitle(currentTitle);
 
     private bool IsTargetValid(WindowCandidate target, int expectedProcessId) =>
         target.ProcessId == (uint)expectedProcessId &&

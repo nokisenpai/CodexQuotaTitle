@@ -37,6 +37,8 @@ public sealed record HelperRuntimeState(
 
     public string? LastRenderedTitle { get; init; }
 
+    public string? CustomTitleBaseTitle { get; init; }
+
     public DateTimeOffset? LastTitleUpdatedAtUtc { get; init; }
 
     public string? LastError { get; init; }

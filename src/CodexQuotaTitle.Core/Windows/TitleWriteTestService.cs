@@ -127,7 +127,9 @@ public sealed class TitleWriteTestService
         var baseTitle = _ownership.GetBaseTitle(currentTitle);
         var templateParts = _templateRenderer.RenderParts(request.Template, request.Quotas);
         var visibleRenderedTitle = templateParts.Render(baseTitle);
-        var titleWithOwnership = _ownership.Apply(currentTitle, templateParts.BeforeBaseTitle, templateParts.AfterBaseTitle);
+        var titleWithOwnership = templateParts.IncludesBaseTitle
+            ? _ownership.ApplyToBaseTitle(baseTitle, templateParts.BeforeBaseTitle, templateParts.AfterBaseTitle)
+            : _ownership.ApplyFullyOwnedTitle(visibleRenderedTitle);
         _log.Write($"TITLE_TEST_BASE_TITLE={baseTitle}");
         _log.Write($"TITLE_TEST_RENDERED={visibleRenderedTitle}");
 
@@ -141,7 +143,9 @@ public sealed class TitleWriteTestService
         var readTitle = _windowAccessor.GetWindowTitle(target.Handle);
         var roundTripVerified = _ownership.HasCompleteOwnedRange(readTitle) &&
             string.Equals(_ownership.GetVisibleTitle(readTitle), visibleRenderedTitle, StringComparison.Ordinal) &&
-            string.Equals(_ownership.GetBaseTitle(readTitle), baseTitle, StringComparison.Ordinal);
+            (templateParts.IncludesBaseTitle
+                ? string.Equals(_ownership.GetBaseTitle(readTitle), baseTitle, StringComparison.Ordinal)
+                : _ownership.IsFullyOwnedTitle(readTitle));
         if (!roundTripVerified)
         {
             _log.Write("TITLE_TEST_ROUNDTRIP_FAILED");
@@ -150,14 +154,15 @@ public sealed class TitleWriteTestService
 
         _log.Write("TITLE_TEST_ROUNDTRIP_OK");
         await _delay.WaitAsync(cancellationToken);
-        return Cleanup(target.Handle, request.HostChatGptProcessId, baseTitle, visibleRenderedTitle);
+        return Cleanup(target.Handle, request.HostChatGptProcessId, baseTitle, visibleRenderedTitle, templateParts.IncludesBaseTitle);
     }
 
     private TitleWriteTestResult Cleanup(
         nint handle,
         int hostChatGptProcessId,
         string baseTitle,
-        string visibleRenderedTitle)
+        string visibleRenderedTitle,
+        bool includesBaseTitle)
     {
         _log.Write("TITLE_TEST_CLEANUP_STARTED");
         if (!IsHandleStillOwnedByHost(handle, hostChatGptProcessId))
@@ -173,7 +178,9 @@ public sealed class TitleWriteTestService
             return new TitleWriteTestResult(true, true, false, true, handle, baseTitle, visibleRenderedTitle, null);
         }
 
-        var cleanedTitle = _ownership.GetBaseTitle(currentTitle);
+        var cleanedTitle = !includesBaseTitle && _ownership.IsFullyOwnedTitle(currentTitle)
+            ? baseTitle
+            : _ownership.GetBaseTitle(currentTitle);
         if (!_windowAccessor.SetWindowTitle(handle, cleanedTitle, out var cleanupError))
         {
             _log.Write($"TITLE_TEST_CLEANUP_FAILED WIN32_ERROR={cleanupError.ToString(CultureInfo.InvariantCulture)}");

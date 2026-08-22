@@ -37,7 +37,7 @@ public sealed record McpHelperServiceRunResult(bool AcquiredProfileSingleton, He
 
 public sealed class McpHelperService
 {
-    public const string HelperVersion = "0.1.0";
+    public const string HelperVersion = "0.1.1";
     private readonly IHelperAppServerSessionFactory _appServerSessionFactory;
     private readonly IHostProcessLifetime _hostProcessLifetime;
     private readonly IHostWindowProvider _hostWindowProvider;
@@ -282,7 +282,8 @@ public sealed class McpHelperService
             settings.Enabled,
             settings.Template,
             settings.DateFormat,
-            HelperQuotaReadResultConverter.ToQuotaReadResult(state)));
+            HelperQuotaReadResultConverter.ToQuotaReadResult(state),
+            state.CustomTitleBaseTitle));
 
         state = state with
         {
@@ -293,6 +294,7 @@ public sealed class McpHelperService
             DateFormat = settings.DateFormat,
             Enabled = settings.Enabled,
             LastRenderedTitle = titleResult.RenderedTitle ?? (titleResult.Cleaned ? null : state.LastRenderedTitle),
+            CustomTitleBaseTitle = titleResult.Success ? titleResult.CustomTitleBaseTitle : state.CustomTitleBaseTitle,
             LastTitleUpdatedAtUtc = titleResult.Changed ? DateTimeOffset.UtcNow : state.LastTitleUpdatedAtUtc,
             LastError = titleResult.Success ? null : titleResult.FailureReason,
             UpdatedAtUtc = DateTimeOffset.UtcNow,
@@ -331,7 +333,8 @@ public sealed class McpHelperService
             false,
             settings.Template,
             settings.DateFormat,
-            HelperQuotaReadResultConverter.ToQuotaReadResult(state)));
+            HelperQuotaReadResultConverter.ToQuotaReadResult(state),
+            state.CustomTitleBaseTitle));
         if (result.Success && result.Cleaned)
         {
             log.TryAppend("TITLE_CLEANUP_OK");
@@ -344,6 +347,7 @@ public sealed class McpHelperService
         state = state with
         {
             LastRenderedTitle = result.Cleaned ? null : state.LastRenderedTitle,
+            CustomTitleBaseTitle = result.Success ? result.CustomTitleBaseTitle : state.CustomTitleBaseTitle,
             LastError = result.Success ? null : result.FailureReason,
             UpdatedAtUtc = DateTimeOffset.UtcNow,
         };
