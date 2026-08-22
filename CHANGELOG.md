@@ -2,6 +2,11 @@
 
 All notable changes to CodexQuotaTitle are documented in this file.
 
+## [0.1.2] - 2026-08-23
+
+- Prevented duplicate helper launches when simultaneous MCP instances bootstrap the same profile.
+- Stops a helper promptly when its Codex Desktop host exits during startup.
+
 ## [0.1.1] - 2026-08-22
 
 - `%base_title%` is now optional, allowing fully custom window titles.

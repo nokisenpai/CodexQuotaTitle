@@ -39,6 +39,8 @@ public sealed record ProfileIdentity(
 
     public string MutexName => $"Local\\CodexQuotaTitle-{ProfileHash}";
 
+    public string BootstrapMutexName => $"Local\\CodexQuotaTitle-Bootstrap-{ProfileHash}";
+
     private static ProfileIdentity CreateCore(string rawCodexHome, bool isExplicit)
     {
         var normalizedCodexHome = Normalize(rawCodexHome);

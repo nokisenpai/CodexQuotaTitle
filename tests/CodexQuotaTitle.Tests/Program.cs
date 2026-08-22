@@ -50,8 +50,11 @@ var tests = new (string Name, Action Execute)[]
     ("MCP does not start a helper when the implicit CODEX_HOME is absent", McpStartupContextDoesNotStartHelperWhenImplicitHomeIsAbsent),
     ("MCP package configuration forwards CODEX_HOME with relative paths", McpPackageConfigurationForwardsCodexHomeRelatively),
     ("MCP starts one helper per profile and forwards host hints", McpBootstrapperStartsOneHelperPerProfile),
-    ("MCP can start distinct helpers for distinct profiles", McpBootstrapperAllowsDistinctProfiles),
+    ("Concurrent MCP bootstraps start one helper for one profile", () => McpBootstrapperSerializesConcurrentStarts().GetAwaiter().GetResult()),
+    ("MCP replaces a stale dead helper runtime state", McpBootstrapperReplacesStaleState),
+    ("MCP can start distinct helpers for distinct profiles", () => McpBootstrapperAllowsDistinctProfiles().GetAwaiter().GetResult()),
     ("Helper uses the host PID, CODEX_HOME, and exits with the host", () => McpHelperServiceUsesBootstrapHintsAndHostLifecycle().GetAwaiter().GetResult()),
+    ("Helper releases state when the host exits during initialization", () => McpHelperServiceStopsWhenHostExitsDuringInitialization().GetAwaiter().GetResult()),
     ("Helper cleanup restores the base after a fully custom title", () => McpHelperCleanupRestoresBaseAfterFullyCustomTitle().GetAwaiter().GetResult()),
     ("Helper refreshes after a quota notification", () => McpHelperRefreshesAfterQuotaNotification().GetAwaiter().GetResult()),
     ("Helper performs a periodic quota fallback refresh", () => McpHelperPerformsPeriodicQuotaFallback().GetAwaiter().GetResult()),
@@ -687,6 +690,9 @@ static void McpBootstrapperStartsOneHelperPerProfile()
         AssertTrue(firstResult.StartedNewHelper, "The first MCP did not start the profile helper.");
         AssertTrue(!secondResult.StartedNewHelper, "The second MCP started another helper for the same profile.");
         AssertTrue(starter.Requests.Count == 1, "More than one helper start was requested for the same profile.");
+        var provisionalState = new HelperRuntimeStateStore(runtimePaths).TryRead();
+        AssertTrue(provisionalState is not null && provisionalState.IsRunning, "The helper provisional runtime state was not written.");
+        AssertTrue(provisionalState!.HelperPid == firstResult.HelperPid, "The provisional runtime state did not contain the helper PID.");
         AssertTrue(starter.Requests[0].HostChatGptPid == 333, "HOST_CHATGPT_PID was not forwarded to the helper.");
         AssertTrue(starter.Requests[0].HostCodexPid == 222, "HOST_CODEX_PID was not forwarded to the helper.");
         AssertEqual("mcp", starter.Requests[0].Origin);
@@ -697,7 +703,80 @@ static void McpBootstrapperStartsOneHelperPerProfile()
     }
 }
 
-static void McpBootstrapperAllowsDistinctProfiles()
+static async Task McpBootstrapperSerializesConcurrentStarts()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-mcp-bootstrap-tests", Guid.NewGuid().ToString("N")));
+    var runtimePaths = HelperRuntimePaths.ForProfile(profile.ProfileHash);
+    try
+    {
+        var liveness = new TestProcessLiveness();
+        var starter = new BlockingTestHelperProcessStarter(liveness);
+        var processTree = CreateDesktopProcessTree();
+        var first = new McpHelperBootstrapper(new McpBootstrapLog(runtimePaths.DirectoryPath), new McpStartupContext(profile.RawCodexHome, profile), processTree, starter, liveness);
+        var second = new McpHelperBootstrapper(new McpBootstrapLog(runtimePaths.DirectoryPath), new McpStartupContext(profile.RawCodexHome, profile), processTree, starter, liveness);
+
+        var firstTask = Task.Run(first.EnsureHelper);
+        await starter.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var secondTask = Task.Run(second.EnsureHelper);
+        await WaitUntilAsync(() => secondTask.Status != TaskStatus.WaitingToRun, TimeSpan.FromSeconds(5));
+        AssertTrue(starter.Requests.Count == 1, "The second concurrent MCP reached helper start before the first bootstrap completed.");
+        starter.ReleaseStart();
+
+        var results = await Task.WhenAll(firstTask, secondTask).WaitAsync(TimeSpan.FromSeconds(5));
+        AssertTrue(results.Count(result => result.StartedNewHelper) == 1, "Simultaneous MCP instances requested more than one helper start.");
+        AssertTrue(starter.Requests.Count == 1, "The profile bootstrap gate did not serialize helper start requests.");
+        AssertTrue(new HelperRuntimeStateStore(runtimePaths).TryRead()?.HelperPid == results.Single(result => result.StartedNewHelper).HelperPid, "The concurrent bootstrap did not retain the provisional helper PID.");
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static void McpBootstrapperReplacesStaleState()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-mcp-bootstrap-tests", Guid.NewGuid().ToString("N")));
+    var runtimePaths = HelperRuntimePaths.ForProfile(profile.ProfileHash);
+    try
+    {
+        const int staleHelperPid = 6_999;
+        var stateStore = new HelperRuntimeStateStore(runtimePaths);
+        stateStore.Write(new HelperRuntimeState(
+            profile.ProfileHash,
+            "mcp",
+            staleHelperPid,
+            333,
+            222,
+            true,
+            false,
+            null,
+            Array.Empty<HelperQuotaSnapshot>(),
+            0,
+            "WINDOW_CORRELATION_AMBIGUOUS",
+            Array.Empty<HelperWindowCandidate>(),
+            DateTimeOffset.UtcNow));
+        var liveness = new TestProcessLiveness();
+        var starter = new TestHelperProcessStarter(liveness);
+        var bootstrapper = new McpHelperBootstrapper(
+            new McpBootstrapLog(runtimePaths.DirectoryPath),
+            new McpStartupContext(profile.RawCodexHome, profile),
+            CreateDesktopProcessTree(),
+            starter,
+            liveness);
+
+        var result = bootstrapper.EnsureHelper();
+
+        AssertTrue(result.StartedNewHelper, "A stale helper state prevented a replacement helper from starting.");
+        AssertTrue(result.HelperPid != staleHelperPid, "The stale helper PID was reused.");
+        AssertTrue(stateStore.TryRead()?.HelperPid == result.HelperPid, "The stale state was not replaced with the new provisional helper PID.");
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static async Task McpBootstrapperAllowsDistinctProfiles()
 {
     var firstProfile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-mcp-bootstrap-tests", Guid.NewGuid().ToString("N"), "first"));
     var secondProfile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-mcp-bootstrap-tests", Guid.NewGuid().ToString("N"), "second"));
@@ -712,8 +791,9 @@ static void McpBootstrapperAllowsDistinctProfiles()
         var first = new McpHelperBootstrapper(new McpBootstrapLog(firstPaths.DirectoryPath), new McpStartupContext(firstProfile.RawCodexHome, firstProfile), processTree, starter, liveness);
         var second = new McpHelperBootstrapper(new McpBootstrapLog(secondPaths.DirectoryPath), new McpStartupContext(secondProfile.RawCodexHome, secondProfile), processTree, starter, liveness);
 
-        AssertTrue(first.EnsureHelper().StartedNewHelper, "The first profile helper was not started.");
-        AssertTrue(second.EnsureHelper().StartedNewHelper, "The distinct profile helper was not started.");
+        var results = await Task.WhenAll(Task.Run(first.EnsureHelper), Task.Run(second.EnsureHelper));
+        AssertTrue(results[0].StartedNewHelper, "The first profile helper was not started.");
+        AssertTrue(results[1].StartedNewHelper, "The distinct profile helper was not started.");
         AssertTrue(starter.Requests.Count == 2, "Distinct profiles did not receive distinct helper starts.");
         AssertTrue(!string.Equals(starter.Requests[0].Profile.ProfileHash, starter.Requests[1].Profile.ProfileHash, StringComparison.Ordinal), "Distinct profiles shared a helper identity.");
     }
@@ -769,6 +849,42 @@ static async Task McpHelperServiceUsesBootstrapHintsAndHostLifecycle()
         AssertTrue(finalResult.AcquiredProfileSingleton, "The primary helper did not own the profile singleton.");
         var stoppedState = stateStore.TryRead();
         AssertTrue(stoppedState is not null && !stoppedState.IsRunning, "The helper did not stop after HOST_CHATGPT_PID exited.");
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static async Task McpHelperServiceStopsWhenHostExitsDuringInitialization()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-mcp-helper-startup-tests", Guid.NewGuid().ToString("N")));
+    var runtimePaths = new HelperRuntimePaths(Path.Combine(Path.GetTempPath(), "cqt-mcp-helper-startup-tests", Guid.NewGuid().ToString("N")));
+    try
+    {
+        var appServerFactory = new BlockingTestAppServerSessionFactory();
+        var hostLifetime = new TestHostProcessLifetime();
+        var titleUpdater = new TestAutomaticTitleUpdateService();
+        var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(new LocalAppDataSettingsPathResolver(Path.Combine(runtimePaths.DirectoryPath, "settings")));
+        var request = new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths);
+        var service = new McpHelperService(
+            appServerFactory,
+            hostLifetime,
+            new TestHostWindowProvider(),
+            settingsFactory,
+            new TestSettingsChangeWatcherFactory(),
+            titleUpdater);
+
+        var run = service.RunAsync(request);
+        await appServerFactory.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        hostLifetime.Complete();
+        var result = await run.WaitAsync(TimeSpan.FromSeconds(5));
+
+        AssertTrue(result.AcquiredProfileSingleton, "The helper did not acquire the profile singleton before startup.");
+        AssertTrue(result.FinalState is not null && !result.FinalState.IsRunning, "The helper did not persist a stopped final state after the host exited during initialization.");
+        AssertTrue(titleUpdater.Requests.Count == 1 && !titleUpdater.Requests[0].Enabled, "The helper refreshed the title before stopping during initialization.");
+        using var singleton = ProfileSingleton.TryAcquire(profile);
+        AssertTrue(singleton.IsOwner, "The helper did not release its profile singleton after the host exited during initialization.");
     }
     finally
     {
@@ -1456,10 +1572,23 @@ file sealed class McpProcessFixture : IDisposable
 file sealed class TestProcessLiveness : IProcessLiveness
 {
     private readonly HashSet<int> _runningProcessIds = [];
+    private readonly object _sync = new();
 
-    public bool IsRunning(int processId) => _runningProcessIds.Contains(processId);
+    public bool IsRunning(int processId)
+    {
+        lock (_sync)
+        {
+            return _runningProcessIds.Contains(processId);
+        }
+    }
 
-    public void Add(int processId) => _runningProcessIds.Add(processId);
+    public void Add(int processId)
+    {
+        lock (_sync)
+        {
+            _runningProcessIds.Add(processId);
+        }
+    }
 }
 
 file sealed class TestHelperProcessStarter : IHelperProcessStarter
@@ -1472,29 +1601,77 @@ file sealed class TestHelperProcessStarter : IHelperProcessStarter
         _liveness = liveness;
     }
 
-    public List<McpHelperStartupRequest> Requests { get; } = [];
+    private readonly List<McpHelperStartupRequest> _requests = [];
+    private readonly object _sync = new();
+
+    public IReadOnlyList<McpHelperStartupRequest> Requests
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _requests.ToArray();
+            }
+        }
+    }
 
     public int Start(McpHelperStartupRequest request)
     {
-        var helperPid = _nextProcessId++;
-        Requests.Add(request);
+        int helperPid;
+        lock (_sync)
+        {
+            helperPid = _nextProcessId++;
+            _requests.Add(request);
+        }
+
         _liveness.Add(helperPid);
-        new HelperRuntimeStateStore(request.RuntimePaths).Write(new HelperRuntimeState(
-            request.Profile.ProfileHash,
-            request.Origin,
-            helperPid,
-            request.HostChatGptPid,
-            request.HostCodexPid,
-            true,
-            false,
-            null,
-            Array.Empty<HelperQuotaSnapshot>(),
-            0,
-            "WINDOW_CORRELATION_AMBIGUOUS",
-            Array.Empty<HelperWindowCandidate>(),
-            DateTimeOffset.UtcNow));
         return helperPid;
     }
+}
+
+file sealed class BlockingTestHelperProcessStarter : IHelperProcessStarter
+{
+    private readonly TestProcessLiveness _liveness;
+    private readonly List<McpHelperStartupRequest> _requests = [];
+    private readonly object _sync = new();
+    private int _nextProcessId = 8_000;
+
+    public BlockingTestHelperProcessStarter(TestProcessLiveness liveness)
+    {
+        _liveness = liveness;
+    }
+
+    public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public IReadOnlyList<McpHelperStartupRequest> Requests
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _requests.ToArray();
+            }
+        }
+    }
+
+    public int Start(McpHelperStartupRequest request)
+    {
+        int helperPid;
+        lock (_sync)
+        {
+            helperPid = _nextProcessId++;
+            _requests.Add(request);
+        }
+
+        _liveness.Add(helperPid);
+        Started.TrySetResult();
+        Release.Task.GetAwaiter().GetResult();
+        return helperPid;
+    }
+
+    public void ReleaseStart() => Release.TrySetResult();
 }
 
 file sealed class TestHostProcessLifetime : IHostProcessLifetime
@@ -1520,6 +1697,18 @@ file sealed class TestAppServerSessionFactory : IHelperAppServerSessionFactory
         CodexHomes.Add(codexHome);
         Started.TrySetResult();
         return Task.FromResult<IHelperAppServerSession>(Session);
+    }
+}
+
+file sealed class BlockingTestAppServerSessionFactory : IHelperAppServerSessionFactory
+{
+    public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public async Task<IHelperAppServerSession> StartAsync(string codexHome, CancellationToken cancellationToken)
+    {
+        Started.TrySetResult();
+        await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        throw new InvalidOperationException("The blocking App Server factory unexpectedly completed.");
     }
 }
 

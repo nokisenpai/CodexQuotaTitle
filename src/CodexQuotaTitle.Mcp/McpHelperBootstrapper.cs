@@ -85,8 +85,16 @@ public sealed class McpHelperBootstrapper
             return new McpHelperBootstrapResult(false, null, "host-chatgpt-pid-unavailable");
         }
 
-        var runtimePaths = HelperRuntimePaths.ForProfile(profile.ProfileHash);
-        var stateStore = new HelperRuntimeStateStore(runtimePaths);
+        var request = new McpHelperStartupRequest(
+            _startupContext.CodexHome,
+            profile,
+            hostChatGptPid.Value,
+            _processTree.FindProcessId("codex.exe"),
+            "mcp",
+            HelperRuntimePaths.ForProfile(profile.ProfileHash));
+
+        using var bootstrapGate = ProfileBootstrapGate.Acquire(profile);
+        var stateStore = new HelperRuntimeStateStore(request.RuntimePaths);
         var existingState = stateStore.TryRead();
         if (existingState is not null &&
             string.Equals(existingState.ProfileIdentity, profile.ProfileHash, StringComparison.Ordinal) &&
@@ -97,15 +105,9 @@ public sealed class McpHelperBootstrapper
             return new McpHelperBootstrapResult(false, existingState.HelperPid, "already-running");
         }
 
-        var request = new McpHelperStartupRequest(
-            _startupContext.CodexHome,
-            profile,
-            hostChatGptPid.Value,
-            _processTree.FindProcessId("codex.exe"),
-            "mcp",
-            runtimePaths);
         _bootstrapLog.TryAppend($"MCP_HELPER_START_REQUESTED PROFILE_IDENTITY={profile.ProfileHash} HOST_CHATGPT_PID={hostChatGptPid}");
         var helperPid = _helperProcessStarter.Start(request);
+        stateStore.Write(CreateProvisionalState(request, helperPid));
         _bootstrapLog.TryAppend($"MCP_HELPER_PROCESS_STARTED PID={helperPid}");
         return new McpHelperBootstrapResult(true, helperPid, "started");
     }
@@ -139,6 +141,26 @@ public sealed class McpHelperBootstrapper
     }
 
     public ProfileIdentity? GetProfileIdentity() => _startupContext.ProfileIdentity;
+
+    private static HelperRuntimeState CreateProvisionalState(McpHelperStartupRequest request, int helperPid) =>
+        new(
+            request.Profile.ProfileHash,
+            request.Origin,
+            helperPid,
+            request.HostChatGptPid,
+            request.HostCodexPid,
+            true,
+            false,
+            null,
+            Array.Empty<HelperQuotaSnapshot>(),
+            0,
+            "WINDOW_CORRELATION_AMBIGUOUS",
+            Array.Empty<HelperWindowCandidate>(),
+            DateTimeOffset.UtcNow)
+        {
+            PluginVersion = McpHelperService.HelperVersion,
+            HelperVersion = McpHelperService.HelperVersion,
+        };
 }
 
 public sealed class CurrentProcessLiveness : IProcessLiveness

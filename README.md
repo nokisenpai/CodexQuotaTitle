@@ -14,7 +14,7 @@ Codex - Project | W 89% • 24/08 18:00
 2. Select **GitHub URL**.
 3. Enter `https://github.com/nokisenpai/CodexQuotaTitle`.
 4. Install **CodexQuotaTitle** from the marketplace and approve the requested plugin access.
-5. Create or reopen a Codex Desktop task. The bundled MCP starts the profile-scoped helper automatically.
+5. Create or reopen a Codex Desktop task. The bundled MCP starts the profile-scoped helper automatically when the task/session is opened or resumed.
 
 ### Development installation
 
@@ -26,7 +26,7 @@ Development uses the local marketplace already configured on the developer machi
 
 ## Automatic quota updates
 
-The helper starts with Codex Desktop and keeps the title current from Codex App Server rate-limit updates, with a periodic resynchronization as a fallback. It updates a title only when it can correlate exactly one visible Codex Desktop window to the Desktop host process. If correlation is ambiguous, the title is left unchanged.
+The helper starts automatically when a Codex Desktop task/session is opened or resumed. It keeps the title current from Codex App Server rate-limit updates, with a periodic resynchronization as a fallback. It updates a title only when it can correlate exactly one visible Codex Desktop window to the Desktop host process. If correlation is ambiguous, the title is left unchanged.
 
 ## Profile behavior
 

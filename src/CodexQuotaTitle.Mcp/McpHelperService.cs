@@ -37,7 +37,7 @@ public sealed record McpHelperServiceRunResult(bool AcquiredProfileSingleton, He
 
 public sealed class McpHelperService
 {
-    public const string HelperVersion = "0.1.1";
+    public const string HelperVersion = "0.1.2";
     private readonly IHelperAppServerSessionFactory _appServerSessionFactory;
     private readonly IHostProcessLifetime _hostProcessLifetime;
     private readonly IHostWindowProvider _hostWindowProvider;
@@ -82,6 +82,9 @@ public sealed class McpHelperService
             return new McpHelperServiceRunResult(false, stateStore.TryRead());
         }
 
+        using var hostLifetimeCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var hostExitTask = _hostProcessLifetime.WaitForExitAsync(request.HostChatGptPid, hostLifetimeCancellation.Token);
+
         var settingsStore = _settingsStoreFactory.Create(request.Profile);
         var settingsResult = settingsStore.LoadOrCreate();
         var state = CreateInitialState(request, settingsResult.Settings);
@@ -100,13 +103,18 @@ public sealed class McpHelperService
         using var quotaNotificationSignal = new SemaphoreSlim(0, 1);
         var quotaNotificationGate = new object();
         QuotaSnapshot? latestQuotaNotification = null;
+        var hostExitedDuringStartup = false;
         try
         {
             try
             {
                 using var startupTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 startupTimeout.CancelAfter(TimeSpan.FromSeconds(20));
-                appServerSession = await _appServerSessionFactory.StartAsync(request.CodexHome, startupTimeout.Token);
+                await ThrowIfHostExitedDuringStartupAsync(hostExitTask);
+                appServerSession = await AwaitStartupOperationAsync(
+                    _appServerSessionFactory.StartAsync(request.CodexHome, startupTimeout.Token),
+                    hostExitTask,
+                    startupTimeout);
                 appServerSession.RateLimitsUpdated += (_, snapshot) =>
                 {
                     lock (quotaNotificationGate)
@@ -129,7 +137,11 @@ public sealed class McpHelperService
                 stateStore.Write(state);
                 log.TryAppend("APP_SERVER_INITIALIZED");
 
-                var account = await appServerSession.ReadAccountAsync(startupTimeout.Token);
+                await ThrowIfHostExitedDuringStartupAsync(hostExitTask);
+                var account = await AwaitStartupOperationAsync(
+                    appServerSession.ReadAccountAsync(startupTimeout.Token),
+                    hostExitTask,
+                    startupTimeout);
                 state = state with
                 {
                     Account = new HelperAccountDiagnostic(account.Type, account.PlanType, account.RequiresOpenAiAuth),
@@ -138,10 +150,19 @@ public sealed class McpHelperService
                 stateStore.Write(state);
                 log.TryAppend("ACCOUNT_READ_OK");
 
-                var quotas = await appServerSession.ReadRateLimitsAsync(startupTimeout.Token);
+                await ThrowIfHostExitedDuringStartupAsync(hostExitTask);
+                var quotas = await AwaitStartupOperationAsync(
+                    appServerSession.ReadRateLimitsAsync(startupTimeout.Token),
+                    hostExitTask,
+                    startupTimeout);
                 state = state with { Quotas = ToRuntimeQuotas(quotas), UpdatedAtUtc = DateTimeOffset.UtcNow };
                 stateStore.Write(state);
                 log.TryAppend("RATE_LIMITS_READ_OK");
+            }
+            catch (HostChatGptExitedDuringStartupException)
+            {
+                log.TryAppend("HELPER_SERVICE_STOPPED_HOST_CHATGPT_EXITED");
+                hostExitedDuringStartup = true;
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
@@ -155,78 +176,93 @@ public sealed class McpHelperService
             {
                 log.AppendException("APP_SERVER_FAILED", exception);
             }
-
-            state = RefreshTitle(state, request, settingsStore, stateStore, log, "startup");
-            using var settingsWatcher = _settingsChangeWatcherFactory.Create(settingsStore.Paths);
-            var hostExitTask = _hostProcessLifetime.WaitForExitAsync(request.HostChatGptPid, cancellationToken);
-
-            while (!cancellationToken.IsCancellationRequested)
+            if (!hostExitedDuringStartup)
             {
-                using var waitCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                var periodicTask = Task.Delay(_refreshInterval, waitCancellation.Token);
-                var settingsTask = settingsWatcher.WaitForChangeAsync(waitCancellation.Token);
-                var notificationTask = quotaNotificationSignal.WaitAsync(waitCancellation.Token);
-                var completed = await Task.WhenAny(hostExitTask, periodicTask, settingsTask, notificationTask);
-                waitCancellation.Cancel();
-                if (completed == hostExitTask)
+                try
                 {
-                    await hostExitTask;
+                    await ThrowIfHostExitedDuringStartupAsync(hostExitTask);
+                }
+                catch (HostChatGptExitedDuringStartupException)
+                {
                     log.TryAppend("HELPER_SERVICE_STOPPED_HOST_CHATGPT_EXITED");
-                    break;
+                    hostExitedDuringStartup = true;
                 }
+            }
 
-                if (completed == settingsTask)
-                {
-                    await settingsTask;
-                    state = RefreshTitle(state, request, settingsStore, stateStore, log, "settings-change");
-                    continue;
-                }
+            if (!hostExitedDuringStartup)
+            {
+                state = RefreshTitle(state, request, settingsStore, stateStore, log, "startup");
+                using var settingsWatcher = _settingsChangeWatcherFactory.Create(settingsStore.Paths);
 
-                if (completed == notificationTask)
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    QuotaSnapshot? notification;
-                    lock (quotaNotificationGate)
+                    using var waitCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    var periodicTask = Task.Delay(_refreshInterval, waitCancellation.Token);
+                    var settingsTask = settingsWatcher.WaitForChangeAsync(waitCancellation.Token);
+                    var notificationTask = quotaNotificationSignal.WaitAsync(waitCancellation.Token);
+                    var completed = await Task.WhenAny(hostExitTask, periodicTask, settingsTask, notificationTask);
+                    waitCancellation.Cancel();
+                    if (completed == hostExitTask)
                     {
-                        notification = latestQuotaNotification;
-                        latestQuotaNotification = null;
+                        await hostExitTask;
+                        log.TryAppend("HELPER_SERVICE_STOPPED_HOST_CHATGPT_EXITED");
+                        break;
                     }
 
-                    if (notification is not null)
+                    if (completed == settingsTask)
                     {
-                        state = state with
+                        await settingsTask;
+                        state = RefreshTitle(state, request, settingsStore, stateStore, log, "settings-change");
+                        continue;
+                    }
+
+                    if (completed == notificationTask)
+                    {
+                        QuotaSnapshot? notification;
+                        lock (quotaNotificationGate)
                         {
-                            Quotas = ToRuntimeQuotas(new QuotaReadResult(notification, new Dictionary<string, QuotaSnapshot>())),
-                            UpdatedAtUtc = DateTimeOffset.UtcNow,
-                        };
-                        stateStore.Write(state);
+                            notification = latestQuotaNotification;
+                            latestQuotaNotification = null;
+                        }
+
+                        if (notification is not null)
+                        {
+                            state = state with
+                            {
+                                Quotas = ToRuntimeQuotas(new QuotaReadResult(notification, new Dictionary<string, QuotaSnapshot>())),
+                                UpdatedAtUtc = DateTimeOffset.UtcNow,
+                            };
+                            stateStore.Write(state);
+                        }
+
+                        state = RefreshTitle(state, request, settingsStore, stateStore, log, "rate-limits-notification");
+                        continue;
                     }
 
-                    state = RefreshTitle(state, request, settingsStore, stateStore, log, "rate-limits-notification");
-                    continue;
-                }
-
-                if (appServerSession is not null)
-                {
-                    try
+                    if (appServerSession is not null)
                     {
-                        using var refreshTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                        refreshTimeout.CancelAfter(TimeSpan.FromSeconds(20));
-                        var quotas = await appServerSession.ReadRateLimitsAsync(refreshTimeout.Token);
-                        state = state with { Quotas = ToRuntimeQuotas(quotas), UpdatedAtUtc = DateTimeOffset.UtcNow };
-                        stateStore.Write(state);
-                        log.TryAppend("RATE_LIMITS_PERIODIC_RESYNC_OK");
+                        try
+                        {
+                            using var refreshTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                            refreshTimeout.CancelAfter(TimeSpan.FromSeconds(20));
+                            var quotas = await appServerSession.ReadRateLimitsAsync(refreshTimeout.Token);
+                            state = state with { Quotas = ToRuntimeQuotas(quotas), UpdatedAtUtc = DateTimeOffset.UtcNow };
+                            stateStore.Write(state);
+                            log.TryAppend("RATE_LIMITS_PERIODIC_RESYNC_OK");
+                        }
+                        catch (Exception exception) when (exception is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+                        {
+                            log.AppendException("RATE_LIMITS_PERIODIC_RESYNC_FAILED", exception);
+                        }
                     }
-                    catch (Exception exception) when (exception is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
-                    {
-                        log.AppendException("RATE_LIMITS_PERIODIC_RESYNC_FAILED", exception);
-                    }
-                }
 
-                state = RefreshTitle(state, request, settingsStore, stateStore, log, "periodic");
+                    state = RefreshTitle(state, request, settingsStore, stateStore, log, "periodic");
+                }
             }
         }
         finally
         {
+            hostLifetimeCancellation.Cancel();
             state = CleanupTitle(state, request, settingsStore, stateStore, log);
             if (appServerSession is not null)
             {
@@ -243,6 +279,36 @@ public sealed class McpHelperService
         }
 
         return new McpHelperServiceRunResult(true, state);
+    }
+
+    private static async Task<T> AwaitStartupOperationAsync<T>(
+        Task<T> operation,
+        Task hostExitTask,
+        CancellationTokenSource startupCancellation)
+    {
+        if (await Task.WhenAny(operation, hostExitTask) == hostExitTask)
+        {
+            startupCancellation.Cancel();
+            await hostExitTask;
+            throw new HostChatGptExitedDuringStartupException();
+        }
+
+        return await operation;
+    }
+
+    private static async Task ThrowIfHostExitedDuringStartupAsync(Task hostExitTask)
+    {
+        if (!hostExitTask.IsCompleted)
+        {
+            return;
+        }
+
+        await hostExitTask;
+        throw new HostChatGptExitedDuringStartupException();
+    }
+
+    private sealed class HostChatGptExitedDuringStartupException : Exception
+    {
     }
 
     private HelperRuntimeState RefreshTitle(
