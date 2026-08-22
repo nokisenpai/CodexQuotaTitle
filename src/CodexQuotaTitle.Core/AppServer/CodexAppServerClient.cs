@@ -243,7 +243,7 @@ public sealed record CodexAppServerOptions(
     string? CodexHome = null,
     string ClientName = "CodexQuotaTitle",
     string? ClientTitle = "CodexQuotaTitle",
-    string ClientVersion = "0.1.2");
+    string ClientVersion = "0.1.3");
 
 public sealed class CodexAppServerException : Exception
 {

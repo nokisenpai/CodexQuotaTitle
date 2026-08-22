@@ -23,6 +23,11 @@ var tests = new (string Name, Action Execute)[]
     ("Settings persist template changes per profile", SettingsPersistTemplateChangesPerProfile),
     ("Settings accept line and block comments", SettingsReadJsonWithComments),
     ("Invalid settings JSON keeps the user file intact", SettingsInvalidJsonKeepsUserFile),
+    ("MCP get settings returns its exact path and canonical placeholders", () => McpGetSettingsReturnsPathAndSupportedPlaceholders().GetAwaiter().GetResult()),
+    ("MCP open settings creates and opens the current profile file", () => McpOpenSettingsCreatesAndUsesCurrentProfilePath().GetAwaiter().GetResult()),
+    ("MCP open settings rejects user-provided paths", () => McpOpenSettingsRejectsUserProvidedPath().GetAwaiter().GetResult()),
+    ("MCP open settings reports an unavailable profile", () => McpOpenSettingsReportsUnavailableProfile().GetAwaiter().GetResult()),
+    ("MCP open settings reports shell failures", () => McpOpenSettingsReportsShellFailure().GetAwaiter().GetResult()),
     ("MCP set template preserves generated JSONC header comments", () => McpSetTemplatePreservesGeneratedHeaderComments().GetAwaiter().GetResult()),
     ("MCP set template preserves arbitrary user comments", () => McpSetTemplatePreservesArbitraryUserComments().GetAwaiter().GetResult()),
     ("MCP set template preserves other settings properties", () => McpSetTemplatePreservesOtherSettingsProperties().GetAwaiter().GetResult()),
@@ -241,6 +246,75 @@ static void SettingsReadJsonWithComments()
     AssertTrue(result.Settings.Enabled, "The commented enabled setting was not loaded.");
 }
 
+static async Task McpGetSettingsReturnsPathAndSupportedPlaceholders()
+{
+    using var fixture = new SettingsFixture();
+
+    using var response = await CallMcpToolAsync(fixture, "codex_quota_title_get_settings");
+    var settings = response.RootElement.GetProperty("result").GetProperty("structuredContent");
+    var supportedPlaceholders = settings.GetProperty("supportedPlaceholders").EnumerateArray().Select(item => item.GetString()).ToArray();
+
+    AssertEqual(fixture.Store.Paths.SettingsPath, settings.GetProperty("settingsPath").GetString()!);
+    AssertTrue(
+        supportedPlaceholders.SequenceEqual(QuotaTemplateRenderer.SupportedPlaceholders, StringComparer.Ordinal),
+        "The MCP settings response did not use the canonical supported placeholder list.");
+}
+
+static async Task McpOpenSettingsCreatesAndUsesCurrentProfilePath()
+{
+    using var fixture = new SettingsFixture();
+    var launcher = new TestSettingsFileLauncher();
+    AssertTrue(!File.Exists(fixture.Store.Paths.SettingsPath), "The test settings file already exists.");
+
+    using var response = await CallMcpToolAsync(fixture, "codex_quota_title_open_settings", launcher: launcher);
+    var result = response.RootElement.GetProperty("result").GetProperty("structuredContent");
+
+    AssertTrue(result.GetProperty("opened").GetBoolean(), "The MCP open-settings response did not report success.");
+    AssertEqual(fixture.Store.Paths.SettingsPath, result.GetProperty("settingsPath").GetString()!);
+    AssertTrue(File.Exists(fixture.Store.Paths.SettingsPath), "Open settings did not create the default settings file.");
+    AssertEqual(fixture.Store.Paths.SettingsPath, launcher.OpenedPaths.Single());
+}
+
+static async Task McpOpenSettingsRejectsUserProvidedPath()
+{
+    using var fixture = new SettingsFixture();
+    var launcher = new TestSettingsFileLauncher();
+
+    using var response = await CallMcpToolAsync(
+        fixture,
+        "codex_quota_title_open_settings",
+        new { path = Path.Combine(Path.GetTempPath(), "not-the-settings-file.json") },
+        launcher);
+    var error = response.RootElement.GetProperty("error");
+
+    AssertTrue(error.GetProperty("code").GetInt32() == -32602, "Open settings accepted a user-provided path.");
+    AssertTrue(launcher.OpenedPaths.Count == 0, "Open settings launched a path supplied by the user.");
+}
+
+static async Task McpOpenSettingsReportsUnavailableProfile()
+{
+    using var fixture = new SettingsFixture();
+    var startupContext = new McpStartupContext((string?)null, null);
+
+    using var response = await CallMcpToolAsync(fixture, "codex_quota_title_open_settings", startupContext: startupContext);
+    var error = response.RootElement.GetProperty("error");
+
+    AssertTrue(error.GetProperty("code").GetInt32() == -32000, "An unavailable profile did not produce an MCP storage error.");
+    AssertContains(error.GetProperty("message").GetString()!, "ProfileIdentity is unavailable");
+}
+
+static async Task McpOpenSettingsReportsShellFailure()
+{
+    using var fixture = new SettingsFixture();
+    var launcher = new TestSettingsFileLauncher { Failure = new SettingsFileOpenException("The associated application is unavailable.") };
+
+    using var response = await CallMcpToolAsync(fixture, "codex_quota_title_open_settings", launcher: launcher);
+    var error = response.RootElement.GetProperty("error");
+
+    AssertTrue(error.GetProperty("code").GetInt32() == -32000, "A shell failure did not produce an MCP storage error.");
+    AssertContains(error.GetProperty("message").GetString()!, "Unable to open settings");
+}
+
 static async Task McpSetTemplatePreservesGeneratedHeaderComments()
 {
     using var fixture = new SettingsFixture();
@@ -350,7 +424,17 @@ static async Task McpSetTemplateKeepsInvalidSettingsIntact()
 
 static async Task<JsonDocument> CallMcpSetTemplateAsync(SettingsFixture fixture, string template)
 {
-    var startupContext = new McpStartupContext(fixture.Profile.RawCodexHome, fixture.Profile);
+    return await CallMcpToolAsync(fixture, "codex_quota_title_set_template", new { template });
+}
+
+static async Task<JsonDocument> CallMcpToolAsync(
+    SettingsFixture fixture,
+    string toolName,
+    object? arguments = null,
+    ISettingsFileLauncher? launcher = null,
+    McpStartupContext? startupContext = null)
+{
+    startupContext ??= new McpStartupContext(fixture.Profile.RawCodexHome, fixture.Profile);
     var bootstrapper = new McpHelperBootstrapper(
         new McpBootstrapLog(Path.Combine(fixture.Store.Paths.DirectoryPath, "mcp-bootstrap")),
         startupContext,
@@ -360,7 +444,8 @@ static async Task<JsonDocument> CallMcpSetTemplateAsync(SettingsFixture fixture,
         Environment.ProcessId,
         startupContext,
         bootstrapper,
-        new TestSettingsStoreFactory(fixture.Store));
+        new TestSettingsStoreFactory(fixture.Store),
+        settingsFileLauncher: launcher);
     var request = JsonSerializer.Serialize(new
     {
         jsonrpc = "2.0",
@@ -368,8 +453,8 @@ static async Task<JsonDocument> CallMcpSetTemplateAsync(SettingsFixture fixture,
         method = "tools/call",
         @params = new
         {
-            name = "codex_quota_title_set_template",
-            arguments = new { template },
+            name = toolName,
+            arguments = arguments ?? new { },
         },
     });
     using var input = new StringReader(request);
@@ -1035,7 +1120,10 @@ static async Task McpStdioServerCompletesBootstrapHandshake()
         var tools = toolsResponse.RootElement.GetProperty("result").GetProperty("tools");
         AssertEqual("codex_quota_title_status", tools[0].GetProperty("name").GetString()!);
         AssertEqual("codex_quota_title_get_settings", tools[1].GetProperty("name").GetString()!);
-        AssertEqual("codex_quota_title_set_template", tools[2].GetProperty("name").GetString()!);
+        AssertTrue(tools[1].GetProperty("annotations").GetProperty("readOnlyHint").GetBoolean(), "Get settings is not marked read-only.");
+        AssertEqual("codex_quota_title_open_settings", tools[2].GetProperty("name").GetString()!);
+        AssertTrue(!tools[2].GetProperty("annotations").GetProperty("readOnlyHint").GetBoolean(), "Open settings is incorrectly marked read-only.");
+        AssertEqual("codex_quota_title_set_template", tools[3].GetProperty("name").GetString()!);
     }
 
     await WriteJsonAsync(process, """{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"codex_quota_title_status","arguments":{}}}""");
@@ -1054,6 +1142,11 @@ static async Task McpStdioServerCompletesBootstrapHandshake()
         var settings = settingsResponse.RootElement.GetProperty("result").GetProperty("structuredContent");
         AssertEqual(CodexQuotaTitleSettings.DefaultTemplate, settings.GetProperty("template").GetString()!);
         AssertTrue(settings.GetProperty("enabled").GetBoolean(), "Default settings are not enabled.");
+        var expectedSettingsPath = Path.Combine(fixture.DirectoryPath, ProfileIdentity.Create(codexHome).ProfileHash, "settings.json");
+        AssertEqual(expectedSettingsPath, settings.GetProperty("settingsPath").GetString()!);
+        AssertTrue(
+            settings.GetProperty("supportedPlaceholders").EnumerateArray().Select(item => item.GetString()).SequenceEqual(QuotaTemplateRenderer.SupportedPlaceholders, StringComparer.Ordinal),
+            "The packaged MCP did not return the canonical placeholder list.");
     }
 
     await process.StandardInput.DisposeAsync();
@@ -1524,6 +1617,22 @@ file sealed class TestSettingsStoreFactory : ICodexQuotaTitleSettingsStoreFactor
     }
 
     public CodexQuotaTitleSettingsStore Create(ProfileIdentity profile) => _store;
+}
+
+file sealed class TestSettingsFileLauncher : ISettingsFileLauncher
+{
+    public List<string> OpenedPaths { get; } = [];
+
+    public SettingsFileOpenException? Failure { get; init; }
+
+    public void Open(string settingsPath)
+    {
+        OpenedPaths.Add(settingsPath);
+        if (Failure is not null)
+        {
+            throw Failure;
+        }
+    }
 }
 
 file sealed class EnvironmentVariableScope : IDisposable

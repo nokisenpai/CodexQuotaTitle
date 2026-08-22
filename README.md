@@ -65,6 +65,8 @@ Settings are profile-scoped and stored at:
 %LOCALAPPDATA%\CodexQuotaTitle\<ProfileIdentity>\settings.json
 ```
 
+You can either ask Codex to **“Open my CodexQuotaTitle settings.”** (or equivalent), or open the file manually at the path above. The bundled `codex_quota_title_get_settings` MCP tool returns the exact resolved path for the current profile.
+
 The file is created with these supported keys:
 
 ```json
@@ -75,7 +77,7 @@ The file is created with these supported keys:
 }
 ```
 
-You can update the template through the bundled `codex_quota_title_set_template` MCP tool or by editing `settings.json`. The helper watches the file and applies valid changes without restarting.
+When it is first created, `settings.json` includes a commented list of the supported placeholders. You can update the template through the bundled `codex_quota_title_set_template` MCP tool or by editing `settings.json`. The helper watches the file and applies valid changes without restarting.
 
 ## App Server and privacy
 

@@ -9,7 +9,7 @@ namespace CodexQuotaTitle.Mcp;
 public sealed class McpStdioServer
 {
     private const string ServerName = "codex_quota_title";
-    private const string ServerVersion = "0.1.2";
+    private const string ServerVersion = "0.1.3";
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web);
     private readonly McpBootstrapLog _bootstrapLog;
     private readonly int _processId;
@@ -17,6 +17,7 @@ public sealed class McpStdioServer
     private readonly McpHelperBootstrapper _helperBootstrapper;
     private readonly ICodexQuotaTitleSettingsStoreFactory _settingsStoreFactory;
     private readonly QuotaTemplateRenderer _templateRenderer;
+    private readonly ISettingsFileLauncher _settingsFileLauncher;
 
     public McpStdioServer(
         McpBootstrapLog bootstrapLog,
@@ -24,7 +25,8 @@ public sealed class McpStdioServer
         McpStartupContext startupContext,
         McpHelperBootstrapper helperBootstrapper,
         ICodexQuotaTitleSettingsStoreFactory? settingsStoreFactory = null,
-        QuotaTemplateRenderer? templateRenderer = null)
+        QuotaTemplateRenderer? templateRenderer = null,
+        ISettingsFileLauncher? settingsFileLauncher = null)
     {
         _bootstrapLog = bootstrapLog;
         _processId = processId;
@@ -32,6 +34,7 @@ public sealed class McpStdioServer
         _helperBootstrapper = helperBootstrapper;
         _settingsStoreFactory = settingsStoreFactory ?? new CodexQuotaTitleSettingsStoreFactory();
         _templateRenderer = templateRenderer ?? new QuotaTemplateRenderer();
+        _settingsFileLauncher = settingsFileLauncher ?? new WindowsSettingsFileLauncher();
     }
 
     public async Task<int> RunAsync(TextReader input, TextWriter output, CancellationToken cancellationToken = default)
@@ -139,7 +142,8 @@ public sealed class McpStdioServer
         {
             ["tools"] = new JsonArray(
                 CreateTool("codex_quota_title_status", "Codex quota title status", "Returns profile, helper, quota, settings, and correlated-window status.", true, new JsonObject()),
-                CreateTool("codex_quota_title_get_settings", "Get title settings", "Returns the persistent profile settings.", true, new JsonObject()),
+                CreateTool("codex_quota_title_get_settings", "Get title settings", "Returns persistent settings, their path, and available placeholders.", true, new JsonObject()),
+                CreateTool("codex_quota_title_open_settings", "Open title settings", "Opens the CodexQuotaTitle configuration file for the current profile.", false, new JsonObject()),
                 CreateTool(
                     "codex_quota_title_set_template",
                     "Set title template",
@@ -180,6 +184,7 @@ public sealed class McpStdioServer
         {
             "codex_quota_title_status" => CreateToolResponse(CreateStatus(), "MCP_STATUS_TOOL_CALLED"),
             "codex_quota_title_get_settings" => CreateToolResponse(CreateSettingsResponse(), "MCP_GET_SETTINGS_TOOL_CALLED"),
+            "codex_quota_title_open_settings" => CreateToolResponse(OpenSettings(parameters), "MCP_OPEN_SETTINGS_TOOL_CALLED"),
             "codex_quota_title_set_template" => CreateToolResponse(SetTemplate(parameters), "MCP_SET_TEMPLATE_TOOL_CALLED"),
             _ => throw new McpRequestException(-32602, "Unknown tool"),
         };
@@ -219,13 +224,44 @@ public sealed class McpStdioServer
     private JsonObject CreateSettingsResponse()
     {
         _bootstrapLog.TryAppend("MCP_GET_SETTINGS_TOOL_CALLED");
-        var result = GetSettingsStore().LoadOrCreate();
+        var store = GetSettingsStore();
+        var result = store.LoadOrCreate();
         if (result.Error is not null)
         {
             _bootstrapLog.TryAppend($"MCP_SETTINGS_LOAD_FALLBACK REASON={result.Error}");
         }
 
-        return SettingsToJson(result.Settings);
+        var response = SettingsToJson(result.Settings);
+        response["settingsPath"] = store.Paths.SettingsPath;
+        response["supportedPlaceholders"] = JsonSerializer.SerializeToNode(QuotaTemplateRenderer.SupportedPlaceholders, SerializerOptions);
+        return response;
+    }
+
+    private JsonObject OpenSettings(JsonElement parameters)
+    {
+        EnsureNoArguments(parameters);
+        var store = GetSettingsStore();
+        var loadResult = store.LoadOrCreate();
+        var settingsPath = store.Paths.SettingsPath;
+        if (!File.Exists(settingsPath))
+        {
+            throw new McpRequestException(-32000, $"Unable to prepare settings: {loadResult.Error ?? "settings-file-unavailable"}");
+        }
+
+        try
+        {
+            _settingsFileLauncher.Open(settingsPath);
+        }
+        catch (SettingsFileOpenException exception)
+        {
+            throw new McpRequestException(-32000, $"Unable to open settings: {exception.Message}");
+        }
+
+        return new JsonObject
+        {
+            ["opened"] = true,
+            ["settingsPath"] = settingsPath,
+        };
     }
 
     private JsonObject SetTemplate(JsonElement parameters)
@@ -315,6 +351,19 @@ public sealed class McpStdioServer
         }
 
         return _settingsStoreFactory.Create(profile);
+    }
+
+    private static void EnsureNoArguments(JsonElement parameters)
+    {
+        if (!parameters.TryGetProperty("arguments", out var arguments) || arguments.ValueKind == JsonValueKind.Undefined)
+        {
+            return;
+        }
+
+        if (arguments.ValueKind != JsonValueKind.Object || arguments.EnumerateObject().Any())
+        {
+            throw new McpRequestException(-32602, "This tool does not accept arguments.");
+        }
     }
 
     private static JsonObject SettingsToJson(CodexQuotaTitleSettings settings) => new()
