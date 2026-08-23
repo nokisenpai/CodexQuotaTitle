@@ -22,6 +22,8 @@ public sealed record McpHelperStatus(
     string AppServerStatus,
     string? AppServerLastError,
     string? AppServerLastExceptionType,
+    string AppServerExecutableSource,
+    bool? AppServerExecutableAvailable,
     IReadOnlyList<HelperQuotaSnapshot> Quotas,
     int? CandidateWindowCount,
     string? WindowCorrelation,
@@ -119,7 +121,28 @@ public sealed class McpHelperBootstrapper
     {
         if (_startupContext.ProfileIdentity is not { } profile)
         {
-            return new McpHelperStatus(null, false, null, false, "not-started", null, null, Array.Empty<HelperQuotaSnapshot>(), null, null, null, null, null, null, null, null, null, null, Array.Empty<HelperWindowCandidate>());
+            return new McpHelperStatus(
+                ProfileIdentity: null,
+                HelperRunning: false,
+                HelperPid: null,
+                AppServerConnected: false,
+                AppServerStatus: "not-started",
+                AppServerLastError: null,
+                AppServerLastExceptionType: null,
+                AppServerExecutableSource: "not-started",
+                AppServerExecutableAvailable: null,
+                Quotas: Array.Empty<HelperQuotaSnapshot>(),
+                CandidateWindowCount: null,
+                WindowCorrelation: null,
+                PluginVersion: null,
+                HelperVersion: null,
+                ActiveTemplate: null,
+                DateFormat: null,
+                Enabled: null,
+                LastRenderedTitle: null,
+                LastTitleUpdatedAtUtc: null,
+                LastError: null,
+                Windows: Array.Empty<HelperWindowCandidate>());
         }
 
         var state = new HelperRuntimeStateStore(HelperRuntimePaths.ForProfile(profile.ProfileHash)).TryRead();
@@ -132,6 +155,8 @@ public sealed class McpHelperBootstrapper
             state?.AppServerStatus ?? "not-started",
             state?.AppServerLastError,
             state?.AppServerLastExceptionType,
+            state?.AppServerExecutableSource ?? "not-started",
+            state?.AppServerExecutableAvailable,
             state?.Quotas ?? Array.Empty<HelperQuotaSnapshot>(),
             state?.CandidateWindowCount,
             state?.WindowCorrelation,

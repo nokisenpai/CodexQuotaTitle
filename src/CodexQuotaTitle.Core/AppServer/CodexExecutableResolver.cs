@@ -2,7 +2,7 @@ using System.Diagnostics;
 
 namespace CodexQuotaTitle.AppServer;
 
-internal static class CodexExecutableResolver
+public static class CodexExecutableResolver
 {
     public static string Resolve(string executable)
     {

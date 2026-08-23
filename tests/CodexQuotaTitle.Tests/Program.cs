@@ -60,6 +60,9 @@ var tests = new (string Name, Action Execute)[]
     ("Concurrent MCP bootstraps start one helper for one profile", () => McpBootstrapperSerializesConcurrentStarts().GetAwaiter().GetResult()),
     ("MCP replaces a stale dead helper runtime state", McpBootstrapperReplacesStaleState),
     ("MCP can start distinct helpers for distinct profiles", () => McpBootstrapperAllowsDistinctProfiles().GetAwaiter().GetResult()),
+    ("App Server executable resolution prioritizes the host process", AppServerExecutableResolutionPrioritizesHostProcess),
+    ("App Server executable resolution falls back safely", AppServerExecutableResolutionFallsBackSafely),
+    ("Helper falls back if the host executable disappears before startup", () => HelperFallsBackWhenHostExecutableDisappears().GetAwaiter().GetResult()),
     ("Helper uses the host PID, CODEX_HOME, and exits with the host", () => McpHelperServiceUsesBootstrapHintsAndHostLifecycle().GetAwaiter().GetResult()),
     ("Helper records safe App Server startup diagnostics", () => McpHelperServiceRecordsAppServerStartupDiagnostics().GetAwaiter().GetResult()),
     ("MCP status retains App Server runtime diagnostics", McpHelperStatusRetainsAppServerDiagnostics),
@@ -914,11 +917,123 @@ static async Task McpBootstrapperAllowsDistinctProfiles()
     }
 }
 
+static void AppServerExecutableResolutionPrioritizesHostProcess()
+{
+    var directoryPath = Path.Combine(Path.GetTempPath(), "cqt-app-server-executable-tests", Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directoryPath);
+    try
+    {
+        var hostExecutable = Path.Combine(directoryPath, "host-codex.exe");
+        var fallbackExecutable = Path.Combine(directoryPath, "path-codex.exe");
+        File.WriteAllText(hostExecutable, string.Empty);
+        File.WriteAllText(fallbackExecutable, string.Empty);
+        var resolver = new CodexAppServerExecutableResolver(
+            new TestHostCodexExecutablePathProvider(_ => hostExecutable),
+            _ => fallbackExecutable);
+
+        var resolution = resolver.Resolve(222);
+
+        AssertEqual(hostExecutable, resolution.Executable);
+        AssertEqual("host-process", resolution.Source);
+        AssertTrue(resolution.Available, "The executable from the host process was not marked available.");
+    }
+    finally
+    {
+        Directory.Delete(directoryPath, recursive: true);
+    }
+}
+
+static void AppServerExecutableResolutionFallsBackSafely()
+{
+    var directoryPath = Path.Combine(Path.GetTempPath(), "cqt-app-server-executable-tests", Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directoryPath);
+    try
+    {
+        var fallbackExecutable = Path.Combine(directoryPath, "path-codex.exe");
+        File.WriteAllText(fallbackExecutable, string.Empty);
+
+        var absentHostResolver = new CodexAppServerExecutableResolver(
+            new TestHostCodexExecutablePathProvider(_ => null),
+            _ => fallbackExecutable);
+        var absent = absentHostResolver.Resolve(null);
+        var dead = absentHostResolver.Resolve(222);
+        AssertEqual(fallbackExecutable, absent.Executable);
+        AssertEqual("path", absent.Source);
+        AssertTrue(absent.Available, "The PATH fallback was not marked available.");
+        AssertEqual("path", dead.Source);
+
+        var deniedHostResolver = new CodexAppServerExecutableResolver(
+            new TestHostCodexExecutablePathProvider(_ => throw new UnauthorizedAccessException()),
+            _ => fallbackExecutable);
+        var denied = deniedHostResolver.Resolve(222);
+        AssertEqual(fallbackExecutable, denied.Executable);
+        AssertEqual("path", denied.Source);
+
+        var unresolved = new CodexAppServerExecutableResolver(
+            new TestHostCodexExecutablePathProvider(_ => null),
+            _ => "codex").Resolve(222);
+        AssertEqual("codex", unresolved.Executable);
+        AssertEqual("fallback", unresolved.Source);
+        AssertTrue(!unresolved.Available, "An unresolved fallback was incorrectly reported as available.");
+    }
+    finally
+    {
+        Directory.Delete(directoryPath, recursive: true);
+    }
+}
+
+static async Task HelperFallsBackWhenHostExecutableDisappears()
+{
+    var directoryPath = Path.Combine(Path.GetTempPath(), "cqt-app-server-executable-tests", Guid.NewGuid().ToString("N"));
+    var profile = ProfileIdentity.Create(Path.Combine(directoryPath, ".codex"));
+    var runtimePaths = new HelperRuntimePaths(Path.Combine(directoryPath, "runtime"));
+    Directory.CreateDirectory(profile.RawCodexHome!);
+    try
+    {
+        var hostExecutable = Path.Combine(directoryPath, "host-codex.exe");
+        var fallbackExecutable = Path.Combine(directoryPath, "path-codex.exe");
+        File.WriteAllText(hostExecutable, string.Empty);
+        File.WriteAllText(fallbackExecutable, string.Empty);
+        var appServerFactory = new HostExecutableDisappearsAppServerSessionFactory(hostExecutable);
+        var hostLifetime = new TestHostProcessLifetime();
+        var executableResolver = new CodexAppServerExecutableResolver(
+            new TestHostCodexExecutablePathProvider(_ => hostExecutable),
+            _ => fallbackExecutable);
+        var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(new LocalAppDataSettingsPathResolver(Path.Combine(directoryPath, "settings")));
+        var service = new McpHelperService(
+            appServerFactory,
+            hostLifetime,
+            new TestHostWindowProvider(),
+            settingsFactory,
+            new TestSettingsChangeWatcherFactory(),
+            new TestAutomaticTitleUpdateService(),
+            appServerExecutableResolver: executableResolver);
+
+        var run = service.RunAsync(new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths));
+        await appServerFactory.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var stateStore = new HelperRuntimeStateStore(runtimePaths);
+        await WaitUntilAsync(() => stateStore.TryRead()?.AppServerConnected == true, TimeSpan.FromSeconds(5));
+        var state = stateStore.TryRead() ?? throw new InvalidOperationException("The helper did not persist runtime state.");
+        AssertTrue(appServerFactory.Executables.SequenceEqual([hostExecutable, fallbackExecutable]), "The helper did not retry with the fallback executable.");
+        AssertEqual("path", state.AppServerExecutableSource);
+        AssertTrue(state.AppServerExecutableAvailable == true, "The fallback executable was not recorded as available.");
+
+        hostLifetime.Complete();
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+    finally
+    {
+        Directory.Delete(directoryPath, recursive: true);
+    }
+}
+
 static async Task McpHelperServiceUsesBootstrapHintsAndHostLifecycle()
 {
     var userProfileDirectory = Path.Combine(Path.GetTempPath(), "cqt-mcp-helper-tests", Guid.NewGuid().ToString("N"));
     var codexHome = Path.Combine(userProfileDirectory, ".codex");
     Directory.CreateDirectory(codexHome);
+    var hostExecutable = Path.Combine(userProfileDirectory, "codex.exe");
+    File.WriteAllText(hostExecutable, string.Empty);
     var startupContext = McpStartupContext.FromResolver(new CodexHomeResolver(
         static () => null,
         () => userProfileDirectory,
@@ -932,7 +1047,16 @@ static async Task McpHelperServiceUsesBootstrapHintsAndHostLifecycle()
         var windowProvider = new TestHostWindowProvider();
         var request = new McpHelperStartupRequest(startupContext.CodexHome!, profile, 333, 222, "mcp", runtimePaths);
         var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(new LocalAppDataSettingsPathResolver(Path.Combine(runtimePaths.DirectoryPath, "settings")));
-        var service = new McpHelperService(appServerFactory, hostLifetime, windowProvider, settingsFactory, new TestSettingsChangeWatcherFactory());
+        var executableResolver = new CodexAppServerExecutableResolver(
+            new TestHostCodexExecutablePathProvider(_ => hostExecutable),
+            _ => throw new InvalidOperationException("The host executable should take priority."));
+        var service = new McpHelperService(
+            appServerFactory,
+            hostLifetime,
+            windowProvider,
+            settingsFactory,
+            new TestSettingsChangeWatcherFactory(),
+            appServerExecutableResolver: executableResolver);
 
         var firstHelper = service.RunAsync(request);
         await appServerFactory.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -942,11 +1066,14 @@ static async Task McpHelperServiceUsesBootstrapHintsAndHostLifecycle()
         var runningState = stateStore.TryRead();
         AssertTrue(runningState is not null && runningState.IsRunning, "The helper did not persist a running state.");
         AssertEqual(startupContext.CodexHome!, appServerFactory.CodexHomes.Single());
+        AssertEqual(hostExecutable, appServerFactory.Executables.Single());
         AssertTrue(windowProvider.RequestedProcessIds.Single() == 333, "Windows were not filtered with HOST_CHATGPT_PID.");
         AssertTrue(runningState!.AppServerConnected, "The helper did not report an App Server connection.");
         AssertEqual("connected", runningState.AppServerStatus);
         AssertTrue(runningState.AppServerLastError is null, "A successful App Server connection retained an error.");
         AssertTrue(runningState.AppServerLastExceptionType is null, "A successful App Server connection retained an exception type.");
+        AssertEqual("host-process", runningState.AppServerExecutableSource);
+        AssertTrue(runningState.AppServerExecutableAvailable == true, "The host executable was not recorded as available.");
         AssertTrue(runningState.Quotas.Count == 1, "The helper did not persist normalized quotas.");
         AssertTrue(runningState.CandidateWindowCount == 2, "The helper did not persist all top-level host windows.");
         AssertEqual("WINDOW_CORRELATION_UNAMBIGUOUS", runningState.WindowCorrelation);
@@ -1013,6 +1140,8 @@ static void McpHelperStatusRetainsAppServerDiagnostics()
             AppServerStatus = "unavailable",
             AppServerLastError = "The App Server executable could not be started.",
             AppServerLastExceptionType = nameof(CodexAppServerException),
+            AppServerExecutableSource = "fallback",
+            AppServerExecutableAvailable = false,
         });
         var bootstrapper = new McpHelperBootstrapper(
             new McpBootstrapLog(runtimePaths.DirectoryPath),
@@ -1024,6 +1153,8 @@ static void McpHelperStatusRetainsAppServerDiagnostics()
         AssertEqual("unavailable", status.AppServerStatus);
         AssertEqual("The App Server executable could not be started.", status.AppServerLastError!);
         AssertEqual(nameof(CodexAppServerException), status.AppServerLastExceptionType!);
+        AssertEqual("fallback", status.AppServerExecutableSource);
+        AssertTrue(status.AppServerExecutableAvailable == false, "The App Server executable availability was not retained.");
     }
     finally
     {
@@ -1256,6 +1387,8 @@ static async Task McpStdioServerCompletesBootstrapHandshake()
         AssertEqual("not-started", status.GetProperty("appServerStatus").GetString()!);
         AssertTrue(status.GetProperty("appServerLastError").ValueKind == JsonValueKind.Null, "The inactive MCP status reported an unexpected App Server error.");
         AssertTrue(status.GetProperty("appServerLastExceptionType").ValueKind == JsonValueKind.Null, "The inactive MCP status reported an unexpected App Server exception type.");
+        AssertEqual("not-started", status.GetProperty("appServerExecutableSource").GetString()!);
+        AssertTrue(status.GetProperty("appServerExecutableAvailable").ValueKind == JsonValueKind.Null, "The inactive MCP status reported an unexpected App Server executable availability.");
     }
 
     await WriteJsonAsync(process, """{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"codex_quota_title_get_settings","arguments":{}}}""");
@@ -1919,13 +2052,16 @@ file sealed class TestAppServerSessionFactory : IHelperAppServerSessionFactory
 {
     public List<string> CodexHomes { get; } = [];
 
+    public List<string> Executables { get; } = [];
+
     public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public TestAppServerSession Session { get; } = new();
 
-    public Task<IHelperAppServerSession> StartAsync(string codexHome, CancellationToken cancellationToken)
+    public Task<IHelperAppServerSession> StartAsync(CodexAppServerLaunchRequest request, CancellationToken cancellationToken)
     {
-        CodexHomes.Add(codexHome);
+        CodexHomes.Add(request.CodexHome);
+        Executables.Add(request.Executable);
         Started.TrySetResult();
         return Task.FromResult<IHelperAppServerSession>(Session);
     }
@@ -1935,11 +2071,40 @@ file sealed class BlockingTestAppServerSessionFactory : IHelperAppServerSessionF
 {
     public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    public async Task<IHelperAppServerSession> StartAsync(string codexHome, CancellationToken cancellationToken)
+    public async Task<IHelperAppServerSession> StartAsync(CodexAppServerLaunchRequest request, CancellationToken cancellationToken)
     {
         Started.TrySetResult();
         await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
         throw new InvalidOperationException("The blocking App Server factory unexpectedly completed.");
+    }
+}
+
+file sealed class HostExecutableDisappearsAppServerSessionFactory : IHelperAppServerSessionFactory
+{
+    private readonly string _hostExecutable;
+
+    public HostExecutableDisappearsAppServerSessionFactory(string hostExecutable)
+    {
+        _hostExecutable = hostExecutable;
+    }
+
+    public List<string> Executables { get; } = [];
+
+    public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public TestAppServerSession Session { get; } = new();
+
+    public Task<IHelperAppServerSession> StartAsync(CodexAppServerLaunchRequest request, CancellationToken cancellationToken)
+    {
+        Executables.Add(request.Executable);
+        if (Executables.Count == 1)
+        {
+            File.Delete(_hostExecutable);
+            return Task.FromException<IHelperAppServerSession>(new CodexAppServerException("Unable to start codex app-server."));
+        }
+
+        Started.TrySetResult();
+        return Task.FromResult<IHelperAppServerSession>(Session);
     }
 }
 
@@ -1952,8 +2117,20 @@ file sealed class FailingTestAppServerSessionFactory : IHelperAppServerSessionFa
         _exception = exception;
     }
 
-    public Task<IHelperAppServerSession> StartAsync(string codexHome, CancellationToken cancellationToken) =>
+    public Task<IHelperAppServerSession> StartAsync(CodexAppServerLaunchRequest request, CancellationToken cancellationToken) =>
         Task.FromException<IHelperAppServerSession>(_exception);
+}
+
+file sealed class TestHostCodexExecutablePathProvider : IHostCodexExecutablePathProvider
+{
+    private readonly Func<int, string?> _resolve;
+
+    public TestHostCodexExecutablePathProvider(Func<int, string?> resolve)
+    {
+        _resolve = resolve;
+    }
+
+    public string? TryGetExecutablePath(int processId) => _resolve(processId);
 }
 
 file sealed class TestAppServerSession : IHelperAppServerSession

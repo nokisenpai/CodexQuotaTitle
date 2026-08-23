@@ -2,6 +2,10 @@
 
 All notable changes to CodexQuotaTitle are documented in this file.
 
+## [0.1.5] - 2026-08-23
+
+- Resolve the Codex App Server executable from the current Desktop host process before falling back to `PATH`.
+
 ## [0.1.4] - 2026-08-23
 
 - Added safe App Server startup diagnostics to the MCP status response.

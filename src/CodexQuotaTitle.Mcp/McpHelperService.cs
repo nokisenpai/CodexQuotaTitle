@@ -20,8 +20,10 @@ public interface IHelperAppServerSession : IAsyncDisposable
 
 public interface IHelperAppServerSessionFactory
 {
-    Task<IHelperAppServerSession> StartAsync(string codexHome, CancellationToken cancellationToken);
+    Task<IHelperAppServerSession> StartAsync(CodexAppServerLaunchRequest request, CancellationToken cancellationToken);
 }
+
+public sealed record CodexAppServerLaunchRequest(string CodexHome, string Executable);
 
 public interface IHostProcessLifetime
 {
@@ -37,7 +39,7 @@ public sealed record McpHelperServiceRunResult(bool AcquiredProfileSingleton, He
 
 public sealed class McpHelperService
 {
-    public const string HelperVersion = "0.1.4";
+    public const string HelperVersion = "0.1.5";
     private readonly IHelperAppServerSessionFactory _appServerSessionFactory;
     private readonly IHostProcessLifetime _hostProcessLifetime;
     private readonly IHostWindowProvider _hostWindowProvider;
@@ -46,6 +48,7 @@ public sealed class McpHelperService
     private readonly IAutomaticTitleUpdateService _titleUpdateService;
     private readonly QuotaTemplateRenderer _templateRenderer;
     private readonly TimeSpan _refreshInterval;
+    private readonly ICodexAppServerExecutableResolver _appServerExecutableResolver;
 
     public McpHelperService(
         IHelperAppServerSessionFactory? appServerSessionFactory = null,
@@ -55,7 +58,8 @@ public sealed class McpHelperService
         ISettingsChangeWatcherFactory? settingsChangeWatcherFactory = null,
         IAutomaticTitleUpdateService? titleUpdateService = null,
         QuotaTemplateRenderer? templateRenderer = null,
-        TimeSpan? refreshInterval = null)
+        TimeSpan? refreshInterval = null,
+        ICodexAppServerExecutableResolver? appServerExecutableResolver = null)
     {
         _appServerSessionFactory = appServerSessionFactory ?? new CodexHelperAppServerSessionFactory();
         _hostProcessLifetime = hostProcessLifetime ?? new ProcessHostLifetime();
@@ -65,6 +69,7 @@ public sealed class McpHelperService
         _titleUpdateService = titleUpdateService ?? new AutomaticTitleUpdateService();
         _templateRenderer = templateRenderer ?? new QuotaTemplateRenderer();
         _refreshInterval = refreshInterval ?? TimeSpan.FromSeconds(60);
+        _appServerExecutableResolver = appServerExecutableResolver ?? new CodexAppServerExecutableResolver();
     }
 
     public async Task<McpHelperServiceRunResult> RunAsync(
@@ -110,11 +115,50 @@ public sealed class McpHelperService
             {
                 using var startupTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 startupTimeout.CancelAfter(TimeSpan.FromSeconds(20));
+
+                void RecordExecutableResolution(CodexAppServerExecutableResolution resolution)
+                {
+                    state = state with
+                    {
+                        AppServerExecutableSource = resolution.Source,
+                        AppServerExecutableAvailable = resolution.Available,
+                        UpdatedAtUtc = DateTimeOffset.UtcNow
+                    };
+                    stateStore.Write(state);
+                    log.TryAppend(
+                        $"APP_SERVER_EXECUTABLE_SOURCE={resolution.Source} " +
+                        $"AVAILABLE={resolution.Available.ToString().ToUpperInvariant()}");
+                }
+
+                Task<IHelperAppServerSession> StartAppServerAsync(CodexAppServerExecutableResolution resolution) =>
+                    AwaitStartupOperationAsync(
+                        _appServerSessionFactory.StartAsync(
+                            new CodexAppServerLaunchRequest(request.CodexHome, resolution.Executable),
+                            startupTimeout.Token),
+                        hostExitTask,
+                        startupTimeout);
+
                 await ThrowIfHostExitedDuringStartupAsync(hostExitTask);
-                appServerSession = await AwaitStartupOperationAsync(
-                    _appServerSessionFactory.StartAsync(request.CodexHome, startupTimeout.Token),
-                    hostExitTask,
-                    startupTimeout);
+                var executableResolution = _appServerExecutableResolver.Resolve(request.HostCodexPid);
+                if (string.Equals(executableResolution.Source, "host-process", StringComparison.Ordinal) &&
+                    !File.Exists(executableResolution.Executable))
+                {
+                    executableResolution = _appServerExecutableResolver.Resolve(null);
+                }
+
+                RecordExecutableResolution(executableResolution);
+                try
+                {
+                    appServerSession = await StartAppServerAsync(executableResolution).ConfigureAwait(false);
+                }
+                catch (CodexAppServerException) when (
+                    string.Equals(executableResolution.Source, "host-process", StringComparison.Ordinal) &&
+                    !File.Exists(executableResolution.Executable))
+                {
+                    executableResolution = _appServerExecutableResolver.Resolve(null);
+                    RecordExecutableResolution(executableResolution);
+                    appServerSession = await StartAppServerAsync(executableResolution).ConfigureAwait(false);
+                }
                 appServerSession.RateLimitsUpdated += (_, snapshot) =>
                 {
                     lock (quotaNotificationGate)
@@ -512,10 +556,15 @@ public sealed class McpHelperService
 
 public sealed class CodexHelperAppServerSessionFactory : IHelperAppServerSessionFactory
 {
-    public async Task<IHelperAppServerSession> StartAsync(string codexHome, CancellationToken cancellationToken)
+    public async Task<IHelperAppServerSession> StartAsync(
+        CodexAppServerLaunchRequest request,
+        CancellationToken cancellationToken)
     {
         var client = await CodexAppServerClient.StartAsync(
-            new CodexAppServerOptions(CodexHome: codexHome, ClientVersion: McpHelperService.HelperVersion),
+            new CodexAppServerOptions(
+                Executable: request.Executable,
+                CodexHome: request.CodexHome,
+                ClientVersion: McpHelperService.HelperVersion),
             cancellationToken);
         return new CodexHelperAppServerSession(client);
     }
