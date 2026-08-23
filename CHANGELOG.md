@@ -2,6 +2,11 @@
 
 All notable changes to CodexQuotaTitle are documented in this file.
 
+## [0.1.6] - 2026-08-23
+
+- Read quota windows from the active Codex Desktop session rollout instead of launching a second Codex App Server.
+- Correlate rollouts to SessionStart `session_id` and follow session/task changes without restarting the profile helper.
+
 ## [0.1.5] - 2026-08-23
 
 - Resolve the Codex App Server executable from the current Desktop host process before falling back to `PATH`.

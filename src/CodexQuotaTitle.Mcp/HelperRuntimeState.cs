@@ -1,4 +1,5 @@
 using System.Text.Json;
+using CodexQuotaTitle.Sessions;
 
 namespace CodexQuotaTitle.Mcp;
 
@@ -7,7 +8,7 @@ public sealed record HelperRuntimePaths(string DirectoryPath)
     public string StatePath => Path.Combine(DirectoryPath, "helper-state.json");
 
     public static HelperRuntimePaths ForProfile(string profileHash) =>
-        new(Path.Combine(Path.GetTempPath(), "CodexQuotaTitle", "runtime", profileHash));
+        new(ProfileRuntimeDirectory.ForProfile(profileHash));
 }
 
 public sealed record HelperRuntimeState(
@@ -34,6 +35,16 @@ public sealed record HelperRuntimeState(
     public string? DateFormat { get; init; }
 
     public bool Enabled { get; init; }
+
+    public string QuotaSource { get; init; } = "rollout";
+
+    public string QuotaSourceStatus { get; init; } = RolloutQuotaSourceStatuses.WaitingSession;
+
+    public string? ActiveSessionId { get; init; }
+
+    public bool RolloutAvailable { get; init; }
+
+    public DateTimeOffset? LastQuotaUpdatedAtUtc { get; init; }
 
     public string AppServerStatus { get; init; } = "not-started";
 

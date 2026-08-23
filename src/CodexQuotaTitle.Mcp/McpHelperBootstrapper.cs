@@ -18,12 +18,11 @@ public sealed record McpHelperStatus(
     string? ProfileIdentity,
     bool HelperRunning,
     int? HelperPid,
-    bool AppServerConnected,
-    string AppServerStatus,
-    string? AppServerLastError,
-    string? AppServerLastExceptionType,
-    string AppServerExecutableSource,
-    bool? AppServerExecutableAvailable,
+    string QuotaSource,
+    string QuotaSourceStatus,
+    string? ActiveSessionId,
+    bool RolloutAvailable,
+    DateTimeOffset? LastQuotaUpdatedAtUtc,
     IReadOnlyList<HelperQuotaSnapshot> Quotas,
     int? CandidateWindowCount,
     string? WindowCorrelation,
@@ -35,7 +34,20 @@ public sealed record McpHelperStatus(
     string? LastRenderedTitle,
     DateTimeOffset? LastTitleUpdatedAtUtc,
     string? LastError,
-    IReadOnlyList<HelperWindowCandidate> Windows);
+    IReadOnlyList<HelperWindowCandidate> Windows)
+{
+    public bool AppServerConnected => false;
+
+    public string AppServerStatus => "not-started";
+
+    public string? AppServerLastError => null;
+
+    public string? AppServerLastExceptionType => null;
+
+    public string AppServerExecutableSource => "not-started";
+
+    public bool? AppServerExecutableAvailable => null;
+}
 
 public interface IHelperProcessStarter
 {
@@ -125,12 +137,11 @@ public sealed class McpHelperBootstrapper
                 ProfileIdentity: null,
                 HelperRunning: false,
                 HelperPid: null,
-                AppServerConnected: false,
-                AppServerStatus: "not-started",
-                AppServerLastError: null,
-                AppServerLastExceptionType: null,
-                AppServerExecutableSource: "not-started",
-                AppServerExecutableAvailable: null,
+                QuotaSource: "rollout",
+                QuotaSourceStatus: "waiting-session",
+                ActiveSessionId: null,
+                RolloutAvailable: false,
+                LastQuotaUpdatedAtUtc: null,
                 Quotas: Array.Empty<HelperQuotaSnapshot>(),
                 CandidateWindowCount: null,
                 WindowCorrelation: null,
@@ -151,12 +162,11 @@ public sealed class McpHelperBootstrapper
             profile.ProfileHash,
             helperRunning,
             helperRunning ? state!.HelperPid : null,
-            helperRunning && state!.AppServerConnected,
-            state?.AppServerStatus ?? "not-started",
-            state?.AppServerLastError,
-            state?.AppServerLastExceptionType,
-            state?.AppServerExecutableSource ?? "not-started",
-            state?.AppServerExecutableAvailable,
+            state?.QuotaSource ?? "rollout",
+            state?.QuotaSourceStatus ?? "waiting-session",
+            state?.ActiveSessionId,
+            state?.RolloutAvailable ?? false,
+            state?.LastQuotaUpdatedAtUtc,
             state?.Quotas ?? Array.Empty<HelperQuotaSnapshot>(),
             state?.CandidateWindowCount,
             state?.WindowCorrelation,

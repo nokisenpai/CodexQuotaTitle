@@ -7,7 +7,8 @@ public sealed record IntegrationHookInput(
     string? CurrentWorkingDirectory,
     string? Source,
     string? Model,
-    string? PermissionMode)
+    string? PermissionMode,
+    string? TranscriptPath = null)
 {
     public static async Task<IntegrationHookInput> ReadAsync(TextReader input, CancellationToken cancellationToken = default)
     {
@@ -26,7 +27,8 @@ public sealed record IntegrationHookInput(
             ReadString(root, "cwd"),
             ReadString(root, "source"),
             ReadString(root, "model"),
-            ReadString(root, "permission_mode"));
+            ReadString(root, "permission_mode"),
+            ReadString(root, "transcript_path"));
     }
 
     public string SerializeForHelper() =>
@@ -37,6 +39,7 @@ public sealed record IntegrationHookInput(
             source = Source,
             model = Model,
             permission_mode = PermissionMode,
+            transcript_path = TranscriptPath,
         });
 
     private static string? ReadString(JsonElement parent, string propertyName) =>

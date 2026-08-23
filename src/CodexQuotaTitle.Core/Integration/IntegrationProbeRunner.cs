@@ -1,14 +1,13 @@
 using System.Text.Json;
-using CodexQuotaTitle.Accounts;
-using CodexQuotaTitle.AppServer;
 using CodexQuotaTitle.Processes;
 using CodexQuotaTitle.Profiles;
 using CodexQuotaTitle.Quotas;
+using CodexQuotaTitle.Sessions;
 using CodexQuotaTitle.Windows;
 
 namespace CodexQuotaTitle.Integration;
 
-public sealed record IntegrationProbeResult(string ReportPath, ProfileIdentity Profile, bool AcquiredProfileSingleton);
+public sealed record IntegrationProbeResult(string ReportPath, ProfileIdentity Profile, bool ActiveSessionUpdated);
 
 public sealed class IntegrationProbeRunner
 {
@@ -41,8 +40,12 @@ public sealed class IntegrationProbeRunner
             _bootstrapLog.TryAppend("BOOTSTRAP_TO_PLUGIN_DATA_OK");
             stage = "profile-identity";
             profile = ProfileIdentity.FromEnvironment();
-            stage = "profile-singleton";
-            using var singleton = ProfileSingleton.TryAcquire(profile);
+            stage = "active-session";
+            var activeSessionStore = ActiveSessionStore.ForProfile(profile);
+            var activeSessionUpdated = activeSessionStore.Update(
+                hookInput.SessionId,
+                hookInput.TranscriptPath,
+                DateTimeOffset.UtcNow);
             SignalReady(readyEventName);
 
             stage = "process-correlation";
@@ -57,34 +60,10 @@ public sealed class IntegrationProbeRunner
                 .Distinct()
                 .ToArray();
 
-            stage = "account-and-rate-limits";
-            CodexAccountSummary? account = null;
-            QuotaReadResult? quotas = null;
-            var appServerStatus = "not-started";
-            if (singleton.IsOwner)
-            {
-                try
-                {
-                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                    timeout.CancelAfter(TimeSpan.FromSeconds(20));
-                    await using var client = await CodexAppServerClient.StartAsync(cancellationToken: timeout.Token);
-                    account = await client.ReadAccountAsync(timeout.Token);
-                    quotas = await client.ReadRateLimitsAsync(timeout.Token);
-                    appServerStatus = "read";
-                }
-                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-                {
-                    appServerStatus = "timed-out";
-                }
-                catch (CodexAppServerException)
-                {
-                    appServerStatus = "unavailable";
-                }
-            }
-            else
-            {
-                appServerStatus = "skipped-existing-profile-helper";
-            }
+            stage = "rollout-quotas";
+            using var quotaSource = new RolloutQuotaSource(profile);
+            var quotaResult = quotaSource.Refresh();
+            var quotas = quotaResult.Quotas;
 
             stage = "window-correlation";
             var windows = OperatingSystem.IsWindows()
@@ -101,9 +80,11 @@ public sealed class IntegrationProbeRunner
                     helperProcessChain.FirstOrDefault()?.ParentProcessId,
                     launcherProcessChain,
                     helperProcessChain),
-                singleton.IsOwner,
-                appServerStatus,
-                account,
+                activeSessionUpdated,
+                quotaResult.Status,
+                quotaResult.ActiveSessionId,
+                quotaResult.RolloutAvailable,
+                quotaResult.LastQuotaUpdatedAtUtc,
                 quotas is null ? null : QuotaConsoleFormatter.Format(quotas),
                 quotas is null ? Array.Empty<ProbeQuotaSnapshot>() : ToProbeQuotas(quotas),
                 ToProbeWindows(windows));
@@ -115,7 +96,7 @@ public sealed class IntegrationProbeRunner
             var reportJson = SerializeReport(report);
             stage = "report-write";
             File.WriteAllText(reportPath, reportJson);
-            return new IntegrationProbeResult(reportPath, profile, singleton.IsOwner);
+            return new IntegrationProbeResult(reportPath, profile, activeSessionUpdated);
         }
         catch (Exception exception)
         {
@@ -232,9 +213,11 @@ public sealed record IntegrationProbeReport(
     PluginRuntimePaths Plugin,
     ProfileIdentity Profile,
     ProbeProcessDiagnostics Process,
-    bool ProfileSingletonAcquired,
-    string AppServerStatus,
-    CodexAccountSummary? Account,
+    bool ActiveSessionUpdated,
+    string QuotaSourceStatus,
+    string? ActiveSessionId,
+    bool RolloutAvailable,
+    DateTimeOffset? LastQuotaUpdatedAtUtc,
     string? QuotaSummary,
     IReadOnlyList<ProbeQuotaSnapshot> Quotas,
     IReadOnlyList<ProbeWindowCandidate> Windows);

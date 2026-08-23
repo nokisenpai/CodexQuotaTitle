@@ -6,7 +6,9 @@ using CodexQuotaTitle.Mcp;
 using CodexQuotaTitle.Accounts;
 using CodexQuotaTitle.AppServer;
 using CodexQuotaTitle.Settings;
+using CodexQuotaTitle.Sessions;
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using CodexQuotaTitle.Windows;
 
@@ -44,6 +46,16 @@ var tests = new (string Name, Action Execute)[]
     ("Profile singleton allows one owner per profile", ProfileSingletonAllowsOneOwner),
     ("Profile singleton releases after an asynchronous continuation", ProfileSingletonReleasesAcrossThreads),
     ("Hook input survives launcher-helper serialization", HookInputSurvivesHelperSerialization),
+    ("Session state preserves the active session and transcript path", ActiveSessionStatePreservesHookIdentifiers),
+    ("Rollout source resolves the direct transcript path", RolloutSourceResolvesDirectTranscriptPath),
+    ("Rollout source falls back to session ID without choosing the newest file", RolloutSourceFallsBackToSessionId),
+    ("Rollout source rejects a transcript with another session metadata ID", RolloutSourceRejectsWrongSessionMetadata),
+    ("Rollout source keeps the last non-null rate limits", RolloutSourceKeepsLastNonNullRateLimits),
+    ("Rollout source supports primary-only and primary-secondary limits", RolloutSourceSupportsQuotaWindowShapes),
+    ("Rollout source reads an incrementally completed JSONL line", RolloutSourceReadsIncrementalJsonl),
+    ("Rollout source handles append, resync, rotation, and truncation", () => RolloutSourceHandlesFileChanges().GetAwaiter().GetResult()),
+    ("Rollout source never exposes conversation content", RolloutSourceDoesNotExposeConversationContent),
+    ("Rollout source works without any codex executable", RolloutSourceWorksWithoutCodexExecutable),
     ("Bootstrap log records plugin runtime paths", BootstrapLogRecordsPluginRuntimePaths),
     ("Bootstrap log records missing plugin root", BootstrapLogRecordsMissingPluginRoot),
     ("Bootstrap log records missing plugin data", BootstrapLogRecordsMissingPluginData),
@@ -62,14 +74,9 @@ var tests = new (string Name, Action Execute)[]
     ("MCP can start distinct helpers for distinct profiles", () => McpBootstrapperAllowsDistinctProfiles().GetAwaiter().GetResult()),
     ("App Server executable resolution prioritizes the host process", AppServerExecutableResolutionPrioritizesHostProcess),
     ("App Server executable resolution falls back safely", AppServerExecutableResolutionFallsBackSafely),
-    ("Helper falls back if the host executable disappears before startup", () => HelperFallsBackWhenHostExecutableDisappears().GetAwaiter().GetResult()),
-    ("Helper uses the host PID, CODEX_HOME, and exits with the host", () => McpHelperServiceUsesBootstrapHintsAndHostLifecycle().GetAwaiter().GetResult()),
-    ("Helper records safe App Server startup diagnostics", () => McpHelperServiceRecordsAppServerStartupDiagnostics().GetAwaiter().GetResult()),
-    ("MCP status retains App Server runtime diagnostics", McpHelperStatusRetainsAppServerDiagnostics),
-    ("Helper releases state when the host exits during initialization", () => McpHelperServiceStopsWhenHostExitsDuringInitialization().GetAwaiter().GetResult()),
+    ("Helper uses rollout quotas and exits with the host", () => McpHelperServiceUsesRolloutAndHostLifecycle().GetAwaiter().GetResult()),
+    ("MCP status retains rollout runtime diagnostics", McpHelperStatusRetainsRolloutDiagnostics),
     ("Helper cleanup restores the base after a fully custom title", () => McpHelperCleanupRestoresBaseAfterFullyCustomTitle().GetAwaiter().GetResult()),
-    ("Helper refreshes after a quota notification", () => McpHelperRefreshesAfterQuotaNotification().GetAwaiter().GetResult()),
-    ("Helper performs a periodic quota fallback refresh", () => McpHelperPerformsPeriodicQuotaFallback().GetAwaiter().GetResult()),
     ("MCP stdio server completes the bootstrap handshake and status call", () => McpStdioServerCompletesBootstrapHandshake().GetAwaiter().GetResult()),
     ("Win32 title round-trip preserves invisible sentinels", Win32TitleRoundTripPreservesSentinels),
     ("Title write test renders the explicit weekly template", TitleWriteTestRendersWeeklyTemplate),
@@ -559,7 +566,7 @@ static void ProfileSingletonReleasesAcrossThreads()
 
 static void HookInputSurvivesHelperSerialization()
 {
-    var input = new IntegrationHookInput("session-42", "C:\\workspace", "startup", "gpt-5.6-codex", "default");
+    var input = new IntegrationHookInput("session-42", "C:\\workspace", "startup", "gpt-5.6-codex", "default", "C:\\sessions\\rollout-session-42.jsonl");
     using var reader = new StringReader(input.SerializeForHelper());
     var restored = IntegrationHookInput.ReadAsync(reader).GetAwaiter().GetResult();
 
@@ -568,6 +575,162 @@ static void HookInputSurvivesHelperSerialization()
     AssertEqual(input.Source!, restored.Source!);
     AssertEqual(input.Model!, restored.Model!);
     AssertEqual(input.PermissionMode!, restored.PermissionMode!);
+    AssertEqual(input.TranscriptPath!, restored.TranscriptPath!);
+}
+
+static void ActiveSessionStatePreservesHookIdentifiers()
+{
+    using var fixture = new RolloutFixture();
+    var store = new ActiveSessionStore(Path.Combine(fixture.Root, "runtime"));
+
+    AssertTrue(store.Update("session-42", fixture.RolloutPath, DateTimeOffset.UtcNow), "The active session state was not written.");
+    var state = store.TryRead() ?? throw new InvalidOperationException("The active session state was not readable.");
+
+    AssertEqual("session-42", state.SessionId);
+    AssertEqual(fixture.RolloutPath, state.TranscriptPath!);
+}
+
+static void RolloutSourceResolvesDirectTranscriptPath()
+{
+    using var fixture = new RolloutFixture();
+    fixture.WriteRollout("session-direct", [fixture.TokenCount(41m, 10080, 1_788_020_771L, null)]);
+    fixture.Store.Update("session-direct", fixture.RolloutPath, DateTimeOffset.UtcNow);
+
+    using var source = new RolloutQuotaSource(fixture.Profile);
+    var result = source.Refresh();
+
+    AssertEqual(RolloutQuotaSourceStatuses.Watching, result.Status);
+    AssertEqual("session-direct", result.ActiveSessionId!);
+    AssertTrue(result.RolloutAvailable, "The direct transcript path was not accepted.");
+    AssertEquivalent(41m, result.Quotas!.RateLimits!.Primary!.UsedPercent);
+}
+
+static void RolloutSourceFallsBackToSessionId()
+{
+    using var fixture = new RolloutFixture();
+    var olderPath = fixture.RolloutPath;
+    fixture.WriteRollout("session-target", [fixture.TokenCount(33m, 10080, 1_788_020_771L, null)], olderPath);
+    var newerPath = Path.Combine(fixture.SessionsDirectory, "nested", "rollout-session-other.jsonl");
+    fixture.WriteRollout("session-other", [fixture.TokenCount(99m, 300, 1_788_020_771L, null)], newerPath);
+    File.SetLastWriteTimeUtc(newerPath, DateTime.UtcNow.AddMinutes(1));
+    fixture.Store.Update("session-target", null, DateTimeOffset.UtcNow);
+
+    using var source = new RolloutQuotaSource(fixture.Profile);
+    var result = source.Refresh();
+
+    AssertEqual(RolloutQuotaSourceStatuses.Watching, result.Status);
+    AssertEquivalent(33m, result.Quotas!.RateLimits!.Primary!.UsedPercent);
+}
+
+static void RolloutSourceRejectsWrongSessionMetadata()
+{
+    using var fixture = new RolloutFixture();
+    fixture.WriteRollout("session-other", [fixture.TokenCount(33m, 10080, 1_788_020_771L, null)]);
+    fixture.Store.Update("session-target", fixture.RolloutPath, DateTimeOffset.UtcNow);
+
+    using var source = new RolloutQuotaSource(fixture.Profile);
+    var result = source.Refresh();
+
+    AssertEqual(RolloutQuotaSourceStatuses.RolloutNotFound, result.Status);
+    AssertTrue(!result.RolloutAvailable, "A rollout with mismatched session metadata was accepted.");
+}
+
+static void RolloutSourceKeepsLastNonNullRateLimits()
+{
+    using var fixture = new RolloutFixture();
+    fixture.WriteRollout("session-last", [
+        fixture.TokenCount(19m, 300, 1_788_020_771L, fixture.Window(64m, 10080, 1_788_020_772L)),
+        fixture.NullRateLimits(),
+        fixture.TokenCount(41m, 10080, 1_788_020_773L, null),
+        fixture.NullRateLimits(),
+    ]);
+    fixture.Store.Update("session-last", fixture.RolloutPath, DateTimeOffset.UtcNow);
+
+    using var source = new RolloutQuotaSource(fixture.Profile);
+    var result = source.Refresh();
+
+    AssertEquivalent(41m, result.Quotas!.RateLimits!.Primary!.UsedPercent);
+    AssertTrue(result.Quotas.RateLimits.Secondary is null, "A null secondary quota was invented.");
+}
+
+static void RolloutSourceSupportsQuotaWindowShapes()
+{
+    using var fixture = new RolloutFixture();
+    fixture.WriteRollout("session-primary", [fixture.TokenCount(25m, 10080, 1_788_020_771L, null)]);
+    fixture.Store.Update("session-primary", fixture.RolloutPath, DateTimeOffset.UtcNow);
+    using (var primarySource = new RolloutQuotaSource(fixture.Profile))
+    {
+        var primary = primarySource.Refresh().Quotas!.RateLimits!;
+        AssertTrue(primary.Primary is not null && primary.Secondary is null, "Primary-only limits were not preserved.");
+    }
+
+    fixture.WriteRollout("session-both", [fixture.TokenCount(25m, 300, 1_788_020_771L, fixture.Window(64m, 10080, 1_788_020_772L))]);
+    fixture.Store.Update("session-both", fixture.RolloutPath, DateTimeOffset.UtcNow);
+    using var bothSource = new RolloutQuotaSource(fixture.Profile);
+    var both = bothSource.Refresh().Quotas!.RateLimits!;
+    AssertEquivalent(300, both.Primary!.WindowDurationMins!.Value);
+    AssertEquivalent(10080, both.Secondary!.WindowDurationMins!.Value);
+}
+
+static void RolloutSourceReadsIncrementalJsonl()
+{
+    using var fixture = new RolloutFixture();
+    var sessionId = "session-incremental";
+    File.WriteAllText(fixture.RolloutPath, fixture.SessionMeta(sessionId) + Environment.NewLine + fixture.TokenCount(37m, 10080, 1_788_020_771L, null));
+    fixture.Store.Update(sessionId, fixture.RolloutPath, DateTimeOffset.UtcNow);
+    using var source = new RolloutQuotaSource(fixture.Profile);
+
+    AssertEqual(RolloutQuotaSourceStatuses.RateLimitsUnavailable, source.Refresh().Status);
+    File.AppendAllText(fixture.RolloutPath, Environment.NewLine);
+    var result = source.Refresh();
+    AssertEquivalent(37m, result.Quotas!.RateLimits!.Primary!.UsedPercent);
+}
+
+static async Task RolloutSourceHandlesFileChanges()
+{
+    using var fixture = new RolloutFixture();
+    fixture.WriteRollout("session-watch", [fixture.TokenCount(10m, 10080, 1_788_020_771L, null)]);
+    fixture.Store.Update("session-watch", fixture.RolloutPath, DateTimeOffset.UtcNow);
+    using var source = new RolloutQuotaSource(fixture.Profile);
+    AssertEquivalent(10m, source.Refresh().Quotas!.RateLimits!.Primary!.UsedPercent);
+
+    File.AppendAllText(fixture.RolloutPath, fixture.TokenCount(22m, 10080, 1_788_020_772L, null) + Environment.NewLine);
+    await source.WaitForChangeAsync(new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
+    AssertEquivalent(22m, source.Refresh().Quotas!.RateLimits!.Primary!.UsedPercent);
+
+    File.WriteAllText(fixture.RolloutPath, fixture.SessionMeta("session-watch") + Environment.NewLine + fixture.TokenCount(55m, 10080, 1_788_020_773L, null) + Environment.NewLine);
+    AssertEquivalent(55m, source.Refresh().Quotas!.RateLimits!.Primary!.UsedPercent);
+
+    fixture.WriteRollout("session-next", [fixture.TokenCount(66m, 300, 1_788_020_774L, null)]);
+    fixture.Store.Update("session-next", fixture.RolloutPath, DateTimeOffset.UtcNow);
+    AssertEquivalent(66m, source.Refresh().Quotas!.RateLimits!.Primary!.UsedPercent);
+}
+
+static void RolloutSourceDoesNotExposeConversationContent()
+{
+    using var fixture = new RolloutFixture();
+    const string privateConversation = "private-conversation-must-not-escape";
+    fixture.WriteRollout("session-private", [
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"response_item\",\"text\":\"" + privateConversation + "\"}}",
+        fixture.TokenCount(42m, 10080, 1_788_020_771L, null),
+    ]);
+    fixture.Store.Update("session-private", fixture.RolloutPath, DateTimeOffset.UtcNow);
+
+    using var source = new RolloutQuotaSource(fixture.Profile);
+    var result = source.Refresh();
+
+    AssertTrue(!JsonSerializer.Serialize(result).Contains(privateConversation, StringComparison.Ordinal), "Conversation content escaped the rollout quota source.");
+}
+
+static void RolloutSourceWorksWithoutCodexExecutable()
+{
+    using var fixture = new RolloutFixture();
+    fixture.WriteRollout("session-no-cli", [fixture.TokenCount(41m, 10080, 1_788_020_771L, null)]);
+    fixture.Store.Update("session-no-cli", fixture.RolloutPath, DateTimeOffset.UtcNow);
+    AssertTrue(!File.Exists(Path.Combine(fixture.Profile.NormalizedCodexHome, "codex.exe")), "The no-CLI fixture unexpectedly contains codex.exe.");
+
+    using var source = new RolloutQuotaSource(fixture.Profile);
+    AssertEqual(RolloutQuotaSourceStatuses.Watching, source.Refresh().Status);
 }
 
 static void BootstrapLogRecordsPluginRuntimePaths()
@@ -982,6 +1145,98 @@ static void AppServerExecutableResolutionFallsBackSafely()
     }
 }
 
+static async Task McpHelperServiceUsesRolloutAndHostLifecycle()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-rollout-helper-tests", Guid.NewGuid().ToString("N"), ".codex"));
+    var runtimePaths = new HelperRuntimePaths(Path.Combine(Path.GetTempPath(), "cqt-rollout-helper-tests", Guid.NewGuid().ToString("N")));
+    try
+    {
+        var hostLifetime = new TestHostProcessLifetime();
+        var windowProvider = new TestHostWindowProvider();
+        var titleUpdater = new TestAutomaticTitleUpdateService();
+        var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(new LocalAppDataSettingsPathResolver(Path.Combine(runtimePaths.DirectoryPath, "settings")));
+        var source = new TestRolloutQuotaSource(new RolloutQuotaReadResult(
+            RolloutQuotaSourceStatuses.Watching,
+            "session-helper",
+            true,
+            new QuotaReadResult(new QuotaSnapshot("codex", "Codex", new RateLimitWindow(41m, 10080, DateTimeOffset.UtcNow.AddDays(4)), null), new Dictionary<string, QuotaSnapshot>()),
+            DateTimeOffset.UtcNow));
+        var service = new McpHelperService(
+            hostLifetime,
+            windowProvider,
+            settingsFactory,
+            new TestSettingsChangeWatcherFactory(),
+            titleUpdater,
+            rolloutQuotaSourceFactory: new TestRolloutQuotaSourceFactory(source));
+
+        var run = service.RunAsync(new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths));
+        await windowProvider.Enumerated.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var stateStore = new HelperRuntimeStateStore(runtimePaths);
+        await WaitUntilAsync(() => stateStore.TryRead()?.QuotaSourceStatus == RolloutQuotaSourceStatuses.Watching, TimeSpan.FromSeconds(5));
+        var runningState = stateStore.TryRead() ?? throw new InvalidOperationException("The helper did not persist runtime state.");
+        AssertEqual("rollout", runningState.QuotaSource);
+        AssertEqual("session-helper", runningState.ActiveSessionId!);
+        AssertTrue(runningState.Quotas.Single().Primary?.WindowDurationMins == 10080, "The helper did not retain the rollout weekly window.");
+        AssertTrue(titleUpdater.Requests.Count > 0, "The helper did not render from rollout quotas.");
+
+        hostLifetime.Complete();
+        var finalResult = await run.WaitAsync(TimeSpan.FromSeconds(5));
+        AssertTrue(finalResult.AcquiredProfileSingleton, "The primary helper did not own the profile singleton.");
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static void McpHelperStatusRetainsRolloutDiagnostics()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-rollout-status-tests", Guid.NewGuid().ToString("N")));
+    var runtimePaths = HelperRuntimePaths.ForProfile(profile.ProfileHash);
+    try
+    {
+        new HelperRuntimeStateStore(runtimePaths).Write(new HelperRuntimeState(
+            profile.ProfileHash,
+            "mcp",
+            7_001,
+            333,
+            222,
+            true,
+            false,
+            null,
+            Array.Empty<HelperQuotaSnapshot>(),
+            0,
+            "WINDOW_CORRELATION_AMBIGUOUS",
+            Array.Empty<HelperWindowCandidate>(),
+            DateTimeOffset.UtcNow)
+        {
+            QuotaSource = "rollout",
+            QuotaSourceStatus = RolloutQuotaSourceStatuses.Watching,
+            ActiveSessionId = "session-status",
+            RolloutAvailable = true,
+            LastQuotaUpdatedAtUtc = DateTimeOffset.UtcNow,
+        });
+        var liveness = new TestProcessLiveness();
+        liveness.Add(7_001);
+        var bootstrapper = new McpHelperBootstrapper(
+            new McpBootstrapLog(runtimePaths.DirectoryPath),
+            new McpStartupContext(profile.RawCodexHome, profile),
+            new McpProcessTree(null, Array.Empty<McpProcessNode>()),
+            processLiveness: liveness);
+
+        var status = bootstrapper.GetStatus();
+        AssertEqual("rollout", status.QuotaSource);
+        AssertEqual(RolloutQuotaSourceStatuses.Watching, status.QuotaSourceStatus);
+        AssertEqual("session-status", status.ActiveSessionId!);
+        AssertTrue(status.RolloutAvailable, "The rollout availability was not retained.");
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+#pragma warning disable CS8321 // Retained App Server test scaffolding covers optional CLI/dev code.
 static async Task HelperFallsBackWhenHostExecutableDisappears()
 {
     var directoryPath = Path.Combine(Path.GetTempPath(), "cqt-app-server-executable-tests", Guid.NewGuid().ToString("N"));
@@ -1233,7 +1488,6 @@ static async Task McpHelperCleanupRestoresBaseAfterFullyCustomTitle()
     var runtimePaths = new HelperRuntimePaths(Path.Combine(Path.GetTempPath(), "cqt-custom-cleanup-tests", Guid.NewGuid().ToString("N")));
     try
     {
-        var factory = new TestAppServerSessionFactory();
         var hostLifetime = new TestHostProcessLifetime();
         var ownership = new TitleOwnership(new TestSentinels());
         var titleWindow = new TestTitleWriteWindow(333, "Codex - Example Project");
@@ -1242,16 +1496,21 @@ static async Task McpHelperCleanupRestoresBaseAfterFullyCustomTitle()
         {
             Template = "Codex1 • %week_percent_remaining% • %week_reset_date%",
         });
+        var quotaSource = new TestRolloutQuotaSource(new RolloutQuotaReadResult(
+            RolloutQuotaSourceStatuses.Watching,
+            "session-custom-cleanup",
+            true,
+            new QuotaReadResult(new QuotaSnapshot("codex", "Codex", null, new RateLimitWindow(41m, 10080, DateTimeOffset.UtcNow.AddDays(4))), new Dictionary<string, QuotaSnapshot>()),
+            DateTimeOffset.UtcNow));
         var service = new McpHelperService(
-            factory,
             hostLifetime,
             new TestSingleWindowHostProvider(titleWindow),
             settingsFactory,
             new TestSettingsChangeWatcherFactory(),
-            new AutomaticTitleUpdateService(titleWindow, ownership));
+            new AutomaticTitleUpdateService(titleWindow, ownership),
+            rolloutQuotaSourceFactory: new TestRolloutQuotaSourceFactory(quotaSource));
 
         var run = service.RunAsync(new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths));
-        await factory.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await WaitUntilAsync(() => ownership.IsFullyOwnedTitle(titleWindow.Title), TimeSpan.FromSeconds(2));
 
         hostLifetime.Complete();
@@ -1315,6 +1574,7 @@ static async Task McpHelperPerformsPeriodicQuotaFallback()
         DeleteRuntimeDirectory(runtimePaths);
     }
 }
+#pragma warning restore CS8321
 
 static McpProcessTree CreateDesktopProcessTree() =>
     new(
@@ -1384,11 +1644,10 @@ static async Task McpStdioServerCompletesBootstrapHandshake()
         AssertTrue(status.GetProperty("codexHomeObserved").GetBoolean(), "The MCP status tool did not observe CODEX_HOME.");
         AssertEqual("EXPLICIT", status.GetProperty("codexHomeSource").GetString()!);
         AssertTrue(status.GetProperty("codexHomeAvailable").GetBoolean(), "The MCP status tool did not report an available CODEX_HOME.");
-        AssertEqual("not-started", status.GetProperty("appServerStatus").GetString()!);
-        AssertTrue(status.GetProperty("appServerLastError").ValueKind == JsonValueKind.Null, "The inactive MCP status reported an unexpected App Server error.");
-        AssertTrue(status.GetProperty("appServerLastExceptionType").ValueKind == JsonValueKind.Null, "The inactive MCP status reported an unexpected App Server exception type.");
-        AssertEqual("not-started", status.GetProperty("appServerExecutableSource").GetString()!);
-        AssertTrue(status.GetProperty("appServerExecutableAvailable").ValueKind == JsonValueKind.Null, "The inactive MCP status reported an unexpected App Server executable availability.");
+        AssertEqual("rollout", status.GetProperty("quotaSource").GetString()!);
+        AssertEqual(RolloutQuotaSourceStatuses.WaitingSession, status.GetProperty("quotaSourceStatus").GetString()!);
+        AssertTrue(status.GetProperty("rolloutAvailable").ValueKind == JsonValueKind.False, "The inactive MCP status unexpectedly reported an active rollout.");
+        AssertTrue(status.GetProperty("activeSessionId").ValueKind == JsonValueKind.Null, "The inactive MCP status unexpectedly exposed a session.");
     }
 
     await WriteJsonAsync(process, """{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"codex_quota_title_get_settings","arguments":{}}}""");
@@ -1787,6 +2046,15 @@ static void AssertEqual(string expected, string actual)
     }
 }
 
+static void AssertEquivalent<T>(T expected, T actual)
+    where T : IEquatable<T>
+{
+    if (!expected.Equals(actual))
+    {
+        throw new InvalidOperationException($"Expected '{expected}' but got '{actual}'.");
+    }
+}
+
 static void AssertThrows<TException>(Action action)
     where TException : Exception
 {
@@ -2046,6 +2314,96 @@ file sealed class TestHostProcessLifetime : IHostProcessLifetime
         _exit.Task.WaitAsync(cancellationToken);
 
     public void Complete() => _exit.TrySetResult();
+}
+
+file sealed class TestRolloutQuotaSourceFactory : IRolloutQuotaSourceFactory
+{
+    private readonly IRolloutQuotaSource _source;
+
+    public TestRolloutQuotaSourceFactory(IRolloutQuotaSource source)
+    {
+        _source = source;
+    }
+
+    public IRolloutQuotaSource Create(ProfileIdentity profile) => _source;
+}
+
+file sealed class TestRolloutQuotaSource : IRolloutQuotaSource
+{
+    private readonly RolloutQuotaReadResult _result;
+
+    public TestRolloutQuotaSource(RolloutQuotaReadResult result)
+    {
+        _result = result;
+    }
+
+    public RolloutQuotaReadResult Refresh() => _result;
+
+    public Task WaitForChangeAsync(CancellationToken cancellationToken) => Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+
+    public void Dispose()
+    {
+    }
+}
+
+file sealed class RolloutFixture : IDisposable
+{
+    public RolloutFixture()
+    {
+        Root = Path.Combine(Path.GetTempPath(), "cqt-rollout-tests", Guid.NewGuid().ToString("N"));
+        var codexHome = Path.Combine(Root, ".codex");
+        SessionsDirectory = Path.Combine(codexHome, "sessions", "2026", "08", "23");
+        Directory.CreateDirectory(SessionsDirectory);
+        Profile = ProfileIdentity.Create(codexHome);
+        Store = ActiveSessionStore.ForProfile(Profile);
+        RolloutPath = Path.Combine(SessionsDirectory, "rollout-session.jsonl");
+    }
+
+    public string Root { get; }
+
+    public ProfileIdentity Profile { get; }
+
+    public ActiveSessionStore Store { get; }
+
+    public string SessionsDirectory { get; }
+
+    public string RolloutPath { get; }
+
+    public string SessionMeta(string sessionId) =>
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"" + sessionId + "\"}}";
+
+    public string Window(decimal usedPercent, int windowMinutes, long resetsAt) =>
+        "{\"used_percent\":" + usedPercent.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+        ",\"window_minutes\":" + windowMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+        ",\"resets_at\":" + resetsAt.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}";
+
+    public string TokenCount(decimal usedPercent, int windowMinutes, long resetsAt, string? secondary) =>
+        "{\"timestamp\":\"2026-08-23T01:41:44Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"limit_id\":\"codex\",\"limit_name\":\"Codex\",\"plan_type\":\"plus\",\"primary\":" +
+        Window(usedPercent, windowMinutes, resetsAt) + ",\"secondary\":" + (secondary ?? "null") + "}}}";
+
+    public string NullRateLimits() =>
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":null}}";
+
+    public void WriteRollout(string sessionId, IEnumerable<string> events, string? path = null)
+    {
+        var targetPath = path ?? RolloutPath;
+        Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+        File.WriteAllText(targetPath, string.Join(Environment.NewLine, new[] { SessionMeta(sessionId) }.Concat(events)) + Environment.NewLine, Encoding.UTF8);
+    }
+
+    public void Dispose()
+    {
+        var runtimeDirectory = Store.DirectoryPath;
+        if (Directory.Exists(runtimeDirectory))
+        {
+            Directory.Delete(runtimeDirectory, recursive: true);
+        }
+
+        if (Directory.Exists(Root))
+        {
+            Directory.Delete(Root, recursive: true);
+        }
+    }
 }
 
 file sealed class TestAppServerSessionFactory : IHelperAppServerSessionFactory
