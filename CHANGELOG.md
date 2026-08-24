@@ -2,6 +2,10 @@
 
 All notable changes to CodexQuotaTitle are documented in this file.
 
+## [0.1.7] - 2026-08-24
+
+- Fall back to the newest profile-scoped rollout quota snapshot when SessionStart does not provide an active session.
+
 ## [0.1.6] - 2026-08-23
 
 - Read quota windows from the active Codex Desktop session rollout instead of launching a second Codex App Server.

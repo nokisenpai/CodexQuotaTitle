@@ -9,7 +9,7 @@ namespace CodexQuotaTitle.Mcp;
 public sealed class McpStdioServer
 {
     private const string ServerName = "codex_quota_title";
-    private const string ServerVersion = "0.1.6";
+    private const string ServerVersion = "0.1.7";
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web);
     private readonly McpBootstrapLog _bootstrapLog;
     private readonly int _processId;
@@ -209,6 +209,7 @@ public sealed class McpStdioServer
             ["helperPid"] = helperStatus.HelperPid,
             ["quotaSource"] = helperStatus.QuotaSource,
             ["quotaSourceStatus"] = helperStatus.QuotaSourceStatus,
+            ["quotaSelection"] = helperStatus.QuotaSelection,
             ["activeSessionId"] = helperStatus.ActiveSessionId,
             ["rolloutAvailable"] = helperStatus.RolloutAvailable,
             ["lastQuotaUpdatedAtUtc"] = helperStatus.LastQuotaUpdatedAtUtc,

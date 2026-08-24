@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Reflection;
 using CodexQuotaTitle.Profiles;
+using CodexQuotaTitle.Sessions;
 
 namespace CodexQuotaTitle.Mcp;
 
@@ -36,6 +37,8 @@ public sealed record McpHelperStatus(
     string? LastError,
     IReadOnlyList<HelperWindowCandidate> Windows)
 {
+    public string? QuotaSelection { get; init; }
+
     public bool AppServerConnected => false;
 
     public string AppServerStatus => "not-started";
@@ -138,7 +141,7 @@ public sealed class McpHelperBootstrapper
                 HelperRunning: false,
                 HelperPid: null,
                 QuotaSource: "rollout",
-                QuotaSourceStatus: "waiting-session",
+                QuotaSourceStatus: RolloutQuotaSourceStatuses.RolloutNotFound,
                 ActiveSessionId: null,
                 RolloutAvailable: false,
                 LastQuotaUpdatedAtUtc: null,
@@ -153,7 +156,10 @@ public sealed class McpHelperBootstrapper
                 LastRenderedTitle: null,
                 LastTitleUpdatedAtUtc: null,
                 LastError: null,
-                Windows: Array.Empty<HelperWindowCandidate>());
+                Windows: Array.Empty<HelperWindowCandidate>())
+            {
+                QuotaSelection = RolloutQuotaSelections.ProfileFallback,
+            };
         }
 
         var state = new HelperRuntimeStateStore(HelperRuntimePaths.ForProfile(profile.ProfileHash)).TryRead();
@@ -163,7 +169,7 @@ public sealed class McpHelperBootstrapper
             helperRunning,
             helperRunning ? state!.HelperPid : null,
             state?.QuotaSource ?? "rollout",
-            state?.QuotaSourceStatus ?? "waiting-session",
+            state?.QuotaSourceStatus ?? RolloutQuotaSourceStatuses.RolloutNotFound,
             state?.ActiveSessionId,
             state?.RolloutAvailable ?? false,
             state?.LastQuotaUpdatedAtUtc,
@@ -178,7 +184,10 @@ public sealed class McpHelperBootstrapper
             state?.LastRenderedTitle,
             state?.LastTitleUpdatedAtUtc,
             state?.LastError,
-            state?.Windows ?? Array.Empty<HelperWindowCandidate>());
+            state?.Windows ?? Array.Empty<HelperWindowCandidate>())
+        {
+            QuotaSelection = state?.QuotaSelection ?? RolloutQuotaSelections.ProfileFallback,
+        };
     }
 
     public ProfileIdentity? GetProfileIdentity() => _startupContext.ProfileIdentity;

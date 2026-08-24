@@ -10,9 +10,17 @@ public static class RolloutQuotaSourceStatuses
 {
     public const string WaitingSession = "waiting-session";
     public const string RolloutNotFound = "rollout-not-found";
-    public const string Watching = "watching";
+    public const string WatchingSession = "watching-session";
+    public const string WatchingProfile = "watching-profile";
+    public const string Watching = WatchingSession;
     public const string RateLimitsUnavailable = "rate-limits-unavailable";
     public const string Failed = "failed";
+}
+
+public static class RolloutQuotaSelections
+{
+    public const string ActiveSession = "active-session";
+    public const string ProfileFallback = "profile-fallback";
 }
 
 public sealed record RolloutQuotaReadResult(
@@ -21,7 +29,8 @@ public sealed record RolloutQuotaReadResult(
     bool RolloutAvailable,
     QuotaReadResult? Quotas,
     DateTimeOffset? LastQuotaUpdatedAtUtc,
-    string? FailureType = null);
+    string? FailureType = null,
+    string? QuotaSelection = null);
 
 public interface IRolloutQuotaSource : IDisposable
 {
@@ -47,10 +56,11 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
     private readonly ActiveSessionStore _activeSessionStore;
     private readonly SemaphoreSlim _changes = new(0, 1);
     private readonly FileSystemWatcher _activeSessionWatcher;
-    private readonly FileSystemWatcher? _sessionsWatcher;
+    private FileSystemWatcher? _sessionsWatcher;
     private FileSystemWatcher? _rolloutWatcher;
     private string? _rolloutPath;
     private string? _activeSessionId;
+    private string? _quotaSelection;
     private long _offset;
     private readonly ArrayBufferWriter<byte> _partialLine = new();
     private QuotaReadResult? _quotas;
@@ -74,81 +84,105 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
             activeSessionStore.DirectoryPath,
             Path.GetFileName(activeSessionStore.StatePath),
             includeSubdirectories: false);
-        if (Directory.Exists(_sessionsDirectory))
-        {
-            _sessionsWatcher = CreateWatcher(_sessionsDirectory, "*.jsonl", includeSubdirectories: true);
-        }
+        EnsureSessionsWatcher();
     }
 
     public RolloutQuotaReadResult Refresh()
     {
         ThrowIfDisposed();
+        EnsureSessionsWatcher();
         var activeSession = _activeSessionStore.TryRead();
-        if (activeSession is null)
+        if (activeSession is not null)
         {
-            ResetRollout();
-            return new RolloutQuotaReadResult(RolloutQuotaSourceStatuses.WaitingSession, null, false, null, null);
+            var activeRolloutPath = ResolveRollout(activeSession);
+            if (activeRolloutPath is not null)
+            {
+                return RefreshSelectedRollout(
+                    activeRolloutPath,
+                    activeSession.SessionId,
+                    RolloutQuotaSelections.ActiveSession);
+            }
         }
 
-        var resolvedPath = ResolveRollout(activeSession);
-        if (resolvedPath is null)
+        var profileRollout = ResolveLatestProfileRollout();
+        if (profileRollout is null)
         {
             ResetRollout();
-            return new RolloutQuotaReadResult(RolloutQuotaSourceStatuses.RolloutNotFound, activeSession.SessionId, false, null, null);
+            return new RolloutQuotaReadResult(
+                RolloutQuotaSourceStatuses.RolloutNotFound,
+                null,
+                false,
+                null,
+                null,
+                QuotaSelection: RolloutQuotaSelections.ProfileFallback);
         }
 
+        return RefreshSelectedRollout(profileRollout.Path, null, RolloutQuotaSelections.ProfileFallback);
+    }
+
+    private RolloutQuotaReadResult RefreshSelectedRollout(string resolvedPath, string? activeSessionId, string quotaSelection)
+    {
         try
         {
             if (!string.Equals(_rolloutPath, resolvedPath, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(_activeSessionId, activeSession.SessionId, StringComparison.Ordinal))
+                !string.Equals(_activeSessionId, activeSessionId, StringComparison.Ordinal) ||
+                !string.Equals(_quotaSelection, quotaSelection, StringComparison.Ordinal))
             {
-                SwitchRollout(resolvedPath, activeSession.SessionId);
+                SwitchRollout(resolvedPath, activeSessionId, quotaSelection);
             }
 
             ReadAvailableBytes();
+            var watchingStatus = string.Equals(quotaSelection, RolloutQuotaSelections.ActiveSession, StringComparison.Ordinal)
+                ? RolloutQuotaSourceStatuses.WatchingSession
+                : RolloutQuotaSourceStatuses.WatchingProfile;
             return _quotas is null
                 ? new RolloutQuotaReadResult(
                     RolloutQuotaSourceStatuses.RateLimitsUnavailable,
                     _activeSessionId,
                     true,
                     null,
-                    null)
+                    null,
+                    QuotaSelection: _quotaSelection)
                 : new RolloutQuotaReadResult(
-                    RolloutQuotaSourceStatuses.Watching,
+                    watchingStatus,
                     _activeSessionId,
                     true,
                     _quotas,
-                    _lastQuotaUpdatedAtUtc);
+                    _lastQuotaUpdatedAtUtc,
+                    QuotaSelection: _quotaSelection);
         }
         catch (IOException)
         {
             return new RolloutQuotaReadResult(
                 RolloutQuotaSourceStatuses.Failed,
-                activeSession.SessionId,
+                activeSessionId,
                 _rolloutPath is not null,
                 _quotas,
                 _lastQuotaUpdatedAtUtc,
-                "IOException");
+                "IOException",
+                _quotaSelection);
         }
         catch (UnauthorizedAccessException)
         {
             return new RolloutQuotaReadResult(
                 RolloutQuotaSourceStatuses.Failed,
-                activeSession.SessionId,
+                activeSessionId,
                 _rolloutPath is not null,
                 _quotas,
                 _lastQuotaUpdatedAtUtc,
-                "UnauthorizedAccessException");
+                "UnauthorizedAccessException",
+                _quotaSelection);
         }
         catch (JsonException)
         {
             return new RolloutQuotaReadResult(
                 RolloutQuotaSourceStatuses.Failed,
-                activeSession.SessionId,
+                activeSessionId,
                 _rolloutPath is not null,
                 _quotas,
                 _lastQuotaUpdatedAtUtc,
-                "JsonException");
+                "JsonException",
+                _quotaSelection);
         }
     }
 
@@ -206,6 +240,94 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
         return null;
     }
 
+    private ProfileRolloutCandidate? ResolveLatestProfileRollout()
+    {
+        if (!Directory.Exists(_sessionsDirectory))
+        {
+            return null;
+        }
+
+        try
+        {
+            var candidates = Directory
+                .EnumerateFiles(_sessionsDirectory, "*.jsonl", SearchOption.AllDirectories)
+                .Select(path => new FileInfo(path))
+                .OrderByDescending(file => file.LastWriteTimeUtc)
+                .ThenBy(file => file.FullName, StringComparer.OrdinalIgnoreCase);
+
+            ProfileRolloutCandidate? latest = null;
+            foreach (var candidate in candidates)
+            {
+                if (!TryReadLatestRateLimits(candidate, out var snapshot) || snapshot is null)
+                {
+                    continue;
+                }
+
+                if (latest is null || snapshot.IsNewerThan(latest))
+                {
+                    latest = snapshot;
+                }
+            }
+
+            return latest;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private static bool TryReadLatestRateLimits(FileInfo file, out ProfileRolloutCandidate? latest)
+    {
+        latest = null;
+        try
+        {
+            var lastWriteTimeUtc = new DateTimeOffset(file.LastWriteTimeUtc);
+            using var stream = new FileStream(file.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, BufferSize, leaveOpen: false);
+            var lineNumber = 0L;
+            while (reader.ReadLine() is { } line)
+            {
+                lineNumber++;
+                try
+                {
+                    if (!TryReadRateLimits(Encoding.UTF8.GetBytes(line), out var quotas, out var timestamp))
+                    {
+                        continue;
+                    }
+
+                    var snapshot = new ProfileRolloutCandidate(
+                        file.FullName,
+                        timestamp ?? lastWriteTimeUtc,
+                        lastWriteTimeUtc,
+                        lineNumber);
+                    if (latest is null || snapshot.IsNewerThan(latest))
+                    {
+                        latest = snapshot;
+                    }
+                }
+                catch (JsonException)
+                {
+                    // A partially written JSONL line is ignored until the next watcher or resync pass.
+                }
+            }
+
+            return latest is not null;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
     private static bool IsValidRollout(string? path, string expectedSessionId)
     {
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
@@ -241,12 +363,13 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
         return false;
     }
 
-    private void SwitchRollout(string path, string sessionId)
+    private void SwitchRollout(string path, string? activeSessionId, string quotaSelection)
     {
         _rolloutWatcher?.Dispose();
         _rolloutWatcher = CreateWatcher(Path.GetDirectoryName(path)!, Path.GetFileName(path), includeSubdirectories: false);
         _rolloutPath = path;
-        _activeSessionId = sessionId;
+        _activeSessionId = activeSessionId;
+        _quotaSelection = quotaSelection;
         _offset = 0;
         _partialLine.Clear();
         _quotas = null;
@@ -259,6 +382,7 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
         _rolloutWatcher = null;
         _rolloutPath = null;
         _activeSessionId = null;
+        _quotaSelection = null;
         _offset = 0;
         _partialLine.Clear();
         _quotas = null;
@@ -337,10 +461,17 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
     private void ProcessCompleteLine(ReadOnlySpan<byte> line)
     {
         line = TrimUtf8Bom(line);
-        if (TryReadRateLimits(line, out var quotas, out var timestamp))
+        try
         {
-            _quotas = quotas;
-            _lastQuotaUpdatedAtUtc = timestamp ?? DateTimeOffset.UtcNow;
+            if (TryReadRateLimits(line, out var quotas, out var timestamp))
+            {
+                _quotas = quotas;
+                _lastQuotaUpdatedAtUtc = timestamp ?? DateTimeOffset.UtcNow;
+            }
+        }
+        catch (JsonException)
+        {
+            // A partially written JSONL line is ignored until a complete update is available.
         }
     }
 
@@ -597,6 +728,14 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
             ? value[3..]
             : value;
 
+    private void EnsureSessionsWatcher()
+    {
+        if (_sessionsWatcher is null && Directory.Exists(_sessionsDirectory))
+        {
+            _sessionsWatcher = CreateWatcher(_sessionsDirectory, "*.jsonl", includeSubdirectories: true);
+        }
+    }
+
     private FileSystemWatcher CreateWatcher(string directoryPath, string filter, bool includeSubdirectories)
     {
         var watcher = new FileSystemWatcher(directoryPath, filter)
@@ -638,5 +777,32 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
     private void ThrowIfDisposed()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+    }
+
+    private sealed record ProfileRolloutCandidate(
+        string Path,
+        DateTimeOffset ObservedAtUtc,
+        DateTimeOffset LastWriteTimeUtc,
+        long LineNumber)
+    {
+        public bool IsNewerThan(ProfileRolloutCandidate other)
+        {
+            var observedComparison = ObservedAtUtc.CompareTo(other.ObservedAtUtc);
+            if (observedComparison != 0)
+            {
+                return observedComparison > 0;
+            }
+
+            var writeComparison = LastWriteTimeUtc.CompareTo(other.LastWriteTimeUtc);
+            if (writeComparison != 0)
+            {
+                return writeComparison > 0;
+            }
+
+            var lineComparison = LineNumber.CompareTo(other.LineNumber);
+            return lineComparison != 0
+                ? lineComparison > 0
+                : string.Compare(Path, other.Path, StringComparison.OrdinalIgnoreCase) > 0;
+        }
     }
 }

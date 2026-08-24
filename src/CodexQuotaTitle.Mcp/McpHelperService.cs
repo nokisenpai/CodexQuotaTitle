@@ -40,7 +40,7 @@ public sealed record McpHelperServiceRunResult(bool AcquiredProfileSingleton, He
 
 public sealed class McpHelperService
 {
-    public const string HelperVersion = "0.1.6";
+    public const string HelperVersion = "0.1.7";
     private readonly IHostProcessLifetime _hostProcessLifetime;
     private readonly IHostWindowProvider _hostWindowProvider;
     private readonly ICodexQuotaTitleSettingsStoreFactory _settingsStoreFactory;
@@ -209,6 +209,7 @@ public sealed class McpHelperService
         {
             QuotaSource = "rollout",
             QuotaSourceStatus = result.Status,
+            QuotaSelection = result.QuotaSelection,
             ActiveSessionId = result.ActiveSessionId,
             RolloutAvailable = result.RolloutAvailable,
             Quotas = result.Quotas is null ? Array.Empty<HelperQuotaSnapshot>() : ToRuntimeQuotas(result.Quotas),
@@ -352,7 +353,8 @@ public sealed class McpHelperService
             DateFormat = settings.DateFormat,
             Enabled = settings.Enabled,
             QuotaSource = "rollout",
-            QuotaSourceStatus = RolloutQuotaSourceStatuses.WaitingSession,
+            QuotaSourceStatus = RolloutQuotaSourceStatuses.RolloutNotFound,
+            QuotaSelection = RolloutQuotaSelections.ProfileFallback,
         };
 
     private static void LogSettingsLoad(HelperServiceLog log, CodexQuotaTitleSettingsLoadResult result)

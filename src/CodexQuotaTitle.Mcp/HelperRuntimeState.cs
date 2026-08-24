@@ -38,7 +38,9 @@ public sealed record HelperRuntimeState(
 
     public string QuotaSource { get; init; } = "rollout";
 
-    public string QuotaSourceStatus { get; init; } = RolloutQuotaSourceStatuses.WaitingSession;
+    public string QuotaSourceStatus { get; init; } = RolloutQuotaSourceStatuses.RolloutNotFound;
+
+    public string? QuotaSelection { get; init; }
 
     public string? ActiveSessionId { get; init; }
 

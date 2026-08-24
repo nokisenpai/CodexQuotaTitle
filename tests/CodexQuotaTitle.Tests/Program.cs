@@ -49,11 +49,15 @@ var tests = new (string Name, Action Execute)[]
     ("Session state preserves the active session and transcript path", ActiveSessionStatePreservesHookIdentifiers),
     ("Rollout source resolves the direct transcript path", RolloutSourceResolvesDirectTranscriptPath),
     ("Rollout source falls back to session ID without choosing the newest file", RolloutSourceFallsBackToSessionId),
-    ("Rollout source rejects a transcript with another session metadata ID", RolloutSourceRejectsWrongSessionMetadata),
+    ("Rollout source falls back when active session metadata is invalid", RolloutSourceRejectsWrongSessionMetadata),
+    ("Rollout source finds quotas without an active session", RolloutSourceFallsBackToProfileWithoutActiveSession),
+    ("Rollout source selects the newest profile rate-limit snapshot", RolloutSourceSelectsNewestProfileRateLimits),
+    ("Rollout source skips newer files without rate limits", RolloutSourceSkipsNewerFilesWithoutRateLimits),
     ("Rollout source keeps the last non-null rate limits", RolloutSourceKeepsLastNonNullRateLimits),
     ("Rollout source supports primary-only and primary-secondary limits", RolloutSourceSupportsQuotaWindowShapes),
     ("Rollout source reads an incrementally completed JSONL line", RolloutSourceReadsIncrementalJsonl),
     ("Rollout source handles append, resync, rotation, and truncation", () => RolloutSourceHandlesFileChanges().GetAwaiter().GetResult()),
+    ("Rollout source switches profile fallback when another rollout changes", () => RolloutSourceSwitchesProfileFallbackOnOtherRolloutChange().GetAwaiter().GetResult()),
     ("Rollout source never exposes conversation content", RolloutSourceDoesNotExposeConversationContent),
     ("Rollout source works without any codex executable", RolloutSourceWorksWithoutCodexExecutable),
     ("Bootstrap log records plugin runtime paths", BootstrapLogRecordsPluginRuntimePaths),
@@ -75,6 +79,7 @@ var tests = new (string Name, Action Execute)[]
     ("App Server executable resolution prioritizes the host process", AppServerExecutableResolutionPrioritizesHostProcess),
     ("App Server executable resolution falls back safely", AppServerExecutableResolutionFallsBackSafely),
     ("Helper uses rollout quotas and exits with the host", () => McpHelperServiceUsesRolloutAndHostLifecycle().GetAwaiter().GetResult()),
+    ("Helper uses profile fallback without SessionStart", () => McpHelperServiceUsesProfileFallbackWithoutSessionStart().GetAwaiter().GetResult()),
     ("MCP status retains rollout runtime diagnostics", McpHelperStatusRetainsRolloutDiagnostics),
     ("Helper cleanup restores the base after a fully custom title", () => McpHelperCleanupRestoresBaseAfterFullyCustomTitle().GetAwaiter().GetResult()),
     ("MCP stdio server completes the bootstrap handshake and status call", () => McpStdioServerCompletesBootstrapHandshake().GetAwaiter().GetResult()),
@@ -599,7 +604,8 @@ static void RolloutSourceResolvesDirectTranscriptPath()
     using var source = new RolloutQuotaSource(fixture.Profile);
     var result = source.Refresh();
 
-    AssertEqual(RolloutQuotaSourceStatuses.Watching, result.Status);
+    AssertEqual(RolloutQuotaSourceStatuses.WatchingSession, result.Status);
+    AssertEqual(RolloutQuotaSelections.ActiveSession, result.QuotaSelection!);
     AssertEqual("session-direct", result.ActiveSessionId!);
     AssertTrue(result.RolloutAvailable, "The direct transcript path was not accepted.");
     AssertEquivalent(41m, result.Quotas!.RateLimits!.Primary!.UsedPercent);
@@ -618,7 +624,8 @@ static void RolloutSourceFallsBackToSessionId()
     using var source = new RolloutQuotaSource(fixture.Profile);
     var result = source.Refresh();
 
-    AssertEqual(RolloutQuotaSourceStatuses.Watching, result.Status);
+    AssertEqual(RolloutQuotaSourceStatuses.WatchingSession, result.Status);
+    AssertEqual(RolloutQuotaSelections.ActiveSession, result.QuotaSelection!);
     AssertEquivalent(33m, result.Quotas!.RateLimits!.Primary!.UsedPercent);
 }
 
@@ -631,8 +638,58 @@ static void RolloutSourceRejectsWrongSessionMetadata()
     using var source = new RolloutQuotaSource(fixture.Profile);
     var result = source.Refresh();
 
-    AssertEqual(RolloutQuotaSourceStatuses.RolloutNotFound, result.Status);
-    AssertTrue(!result.RolloutAvailable, "A rollout with mismatched session metadata was accepted.");
+    AssertEqual(RolloutQuotaSourceStatuses.WatchingProfile, result.Status);
+    AssertEqual(RolloutQuotaSelections.ProfileFallback, result.QuotaSelection!);
+    AssertTrue(result.ActiveSessionId is null, "An invalid active session was retained during profile fallback.");
+    AssertEquivalent(33m, result.Quotas!.RateLimits!.Primary!.UsedPercent);
+}
+
+static void RolloutSourceFallsBackToProfileWithoutActiveSession()
+{
+    using var fixture = new RolloutFixture();
+    fixture.WriteRollout("session-profile", [fixture.TokenCount(41m, 10080, 1_788_020_771L, null)]);
+
+    using var source = new RolloutQuotaSource(fixture.Profile);
+    var result = source.Refresh();
+
+    AssertEqual(RolloutQuotaSourceStatuses.WatchingProfile, result.Status);
+    AssertEqual(RolloutQuotaSelections.ProfileFallback, result.QuotaSelection!);
+    AssertTrue(result.ActiveSessionId is null, "Profile fallback unexpectedly invented an active session.");
+    AssertTrue(result.RolloutAvailable, "Profile fallback did not expose the selected rollout.");
+    AssertEquivalent(41m, result.Quotas!.RateLimits!.Primary!.UsedPercent);
+}
+
+static void RolloutSourceSelectsNewestProfileRateLimits()
+{
+    using var fixture = new RolloutFixture();
+    var olderSnapshot = fixture.RolloutPath;
+    var newerSnapshot = Path.Combine(fixture.SessionsDirectory, "nested", "rollout-newer.jsonl");
+    fixture.WriteRollout("session-old", [fixture.TokenCount(19m, 10080, 1_788_020_771L, null, "2026-08-23T01:00:00Z")], olderSnapshot);
+    fixture.WriteRollout("session-new", [fixture.TokenCount(73m, 10080, 1_788_020_772L, null, "2026-08-23T02:00:00Z")], newerSnapshot);
+    File.SetLastWriteTimeUtc(olderSnapshot, DateTime.UtcNow.AddMinutes(2));
+    File.SetLastWriteTimeUtc(newerSnapshot, DateTime.UtcNow.AddMinutes(-2));
+
+    using var source = new RolloutQuotaSource(fixture.Profile);
+    var result = source.Refresh();
+
+    AssertEqual(RolloutQuotaSelections.ProfileFallback, result.QuotaSelection!);
+    AssertEquivalent(73m, result.Quotas!.RateLimits!.Primary!.UsedPercent);
+}
+
+static void RolloutSourceSkipsNewerFilesWithoutRateLimits()
+{
+    using var fixture = new RolloutFixture();
+    var quotaPath = fixture.RolloutPath;
+    var noQuotaPath = Path.Combine(fixture.SessionsDirectory, "nested", "rollout-no-quota.jsonl");
+    fixture.WriteRollout("session-quota", [fixture.TokenCount(37m, 10080, 1_788_020_771L, null)], quotaPath);
+    fixture.WriteRollout("session-no-quota", [fixture.NullRateLimits()], noQuotaPath);
+    File.SetLastWriteTimeUtc(noQuotaPath, DateTime.UtcNow.AddMinutes(2));
+
+    using var source = new RolloutQuotaSource(fixture.Profile);
+    var result = source.Refresh();
+
+    AssertEqual(RolloutQuotaSourceStatuses.WatchingProfile, result.Status);
+    AssertEquivalent(37m, result.Quotas!.RateLimits!.Primary!.UsedPercent);
 }
 
 static void RolloutSourceKeepsLastNonNullRateLimits()
@@ -706,6 +763,26 @@ static async Task RolloutSourceHandlesFileChanges()
     AssertEquivalent(66m, source.Refresh().Quotas!.RateLimits!.Primary!.UsedPercent);
 }
 
+static async Task RolloutSourceSwitchesProfileFallbackOnOtherRolloutChange()
+{
+    using var fixture = new RolloutFixture();
+    var firstPath = fixture.RolloutPath;
+    var secondPath = Path.Combine(fixture.SessionsDirectory, "nested", "rollout-other.jsonl");
+    fixture.WriteRollout("session-first", [fixture.TokenCount(20m, 10080, 1_788_020_771L, null, "2026-08-23T01:00:00Z")], firstPath);
+    fixture.WriteRollout("session-other", [fixture.NullRateLimits()], secondPath);
+
+    using var source = new RolloutQuotaSource(fixture.Profile);
+    AssertEquivalent(20m, source.Refresh().Quotas!.RateLimits!.Primary!.UsedPercent);
+
+    File.AppendAllText(secondPath, fixture.TokenCount(61m, 10080, 1_788_020_772L, null, "2026-08-23T02:00:00Z") + Environment.NewLine);
+    await source.WaitForChangeAsync(new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
+    var result = source.Refresh();
+
+    AssertEqual(RolloutQuotaSourceStatuses.WatchingProfile, result.Status);
+    AssertEqual(RolloutQuotaSelections.ProfileFallback, result.QuotaSelection!);
+    AssertEquivalent(61m, result.Quotas!.RateLimits!.Primary!.UsedPercent);
+}
+
 static void RolloutSourceDoesNotExposeConversationContent()
 {
     using var fixture = new RolloutFixture();
@@ -714,11 +791,11 @@ static void RolloutSourceDoesNotExposeConversationContent()
         "{\"type\":\"event_msg\",\"payload\":{\"type\":\"response_item\",\"text\":\"" + privateConversation + "\"}}",
         fixture.TokenCount(42m, 10080, 1_788_020_771L, null),
     ]);
-    fixture.Store.Update("session-private", fixture.RolloutPath, DateTimeOffset.UtcNow);
 
     using var source = new RolloutQuotaSource(fixture.Profile);
     var result = source.Refresh();
 
+    AssertEqual(RolloutQuotaSelections.ProfileFallback, result.QuotaSelection!);
     AssertTrue(!JsonSerializer.Serialize(result).Contains(privateConversation, StringComparison.Ordinal), "Conversation content escaped the rollout quota source.");
 }
 
@@ -1189,6 +1266,44 @@ static async Task McpHelperServiceUsesRolloutAndHostLifecycle()
     }
 }
 
+static async Task McpHelperServiceUsesProfileFallbackWithoutSessionStart()
+{
+    using var fixture = new RolloutFixture();
+    fixture.WriteRollout("session-profile", [fixture.TokenCount(58m, 10080, 1_788_020_771L, null)]);
+    var runtimePaths = new HelperRuntimePaths(Path.Combine(Path.GetTempPath(), "cqt-rollout-profile-helper-tests", Guid.NewGuid().ToString("N")));
+    try
+    {
+        var hostLifetime = new TestHostProcessLifetime();
+        var windowProvider = new TestHostWindowProvider();
+        var titleUpdater = new TestAutomaticTitleUpdateService();
+        var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(new LocalAppDataSettingsPathResolver(Path.Combine(runtimePaths.DirectoryPath, "settings")));
+        var service = new McpHelperService(
+            hostLifetime,
+            windowProvider,
+            settingsFactory,
+            new TestSettingsChangeWatcherFactory(),
+            titleUpdater,
+            refreshInterval: TimeSpan.FromMilliseconds(50));
+
+        var run = service.RunAsync(new McpHelperStartupRequest(fixture.Profile.RawCodexHome!, fixture.Profile, 333, 222, "mcp", runtimePaths));
+        var stateStore = new HelperRuntimeStateStore(runtimePaths);
+        await WaitUntilAsync(
+            () => stateStore.TryRead() is { QuotaSourceStatus: RolloutQuotaSourceStatuses.WatchingProfile, QuotaSelection: RolloutQuotaSelections.ProfileFallback },
+            TimeSpan.FromSeconds(5));
+        var runningState = stateStore.TryRead() ?? throw new InvalidOperationException("The helper did not persist profile fallback state.");
+        AssertTrue(runningState.ActiveSessionId is null, "The helper invented an active session during fallback.");
+        AssertTrue(runningState.Quotas.Single().Primary?.WindowDurationMins == 10080, "The helper did not render profile fallback quotas.");
+        AssertTrue(titleUpdater.Requests.Count > 0, "The helper did not update the title from profile fallback quotas.");
+
+        hostLifetime.Complete();
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
 static void McpHelperStatusRetainsRolloutDiagnostics()
 {
     var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-rollout-status-tests", Guid.NewGuid().ToString("N")));
@@ -1212,6 +1327,7 @@ static void McpHelperStatusRetainsRolloutDiagnostics()
         {
             QuotaSource = "rollout",
             QuotaSourceStatus = RolloutQuotaSourceStatuses.Watching,
+            QuotaSelection = RolloutQuotaSelections.ActiveSession,
             ActiveSessionId = "session-status",
             RolloutAvailable = true,
             LastQuotaUpdatedAtUtc = DateTimeOffset.UtcNow,
@@ -1227,6 +1343,7 @@ static void McpHelperStatusRetainsRolloutDiagnostics()
         var status = bootstrapper.GetStatus();
         AssertEqual("rollout", status.QuotaSource);
         AssertEqual(RolloutQuotaSourceStatuses.Watching, status.QuotaSourceStatus);
+        AssertEqual(RolloutQuotaSelections.ActiveSession, status.QuotaSelection!);
         AssertEqual("session-status", status.ActiveSessionId!);
         AssertTrue(status.RolloutAvailable, "The rollout availability was not retained.");
     }
@@ -1645,7 +1762,8 @@ static async Task McpStdioServerCompletesBootstrapHandshake()
         AssertEqual("EXPLICIT", status.GetProperty("codexHomeSource").GetString()!);
         AssertTrue(status.GetProperty("codexHomeAvailable").GetBoolean(), "The MCP status tool did not report an available CODEX_HOME.");
         AssertEqual("rollout", status.GetProperty("quotaSource").GetString()!);
-        AssertEqual(RolloutQuotaSourceStatuses.WaitingSession, status.GetProperty("quotaSourceStatus").GetString()!);
+        AssertEqual(RolloutQuotaSourceStatuses.RolloutNotFound, status.GetProperty("quotaSourceStatus").GetString()!);
+        AssertEqual(RolloutQuotaSelections.ProfileFallback, status.GetProperty("quotaSelection").GetString()!);
         AssertTrue(status.GetProperty("rolloutAvailable").ValueKind == JsonValueKind.False, "The inactive MCP status unexpectedly reported an active rollout.");
         AssertTrue(status.GetProperty("activeSessionId").ValueKind == JsonValueKind.Null, "The inactive MCP status unexpectedly exposed a session.");
     }
@@ -2377,8 +2495,8 @@ file sealed class RolloutFixture : IDisposable
         ",\"window_minutes\":" + windowMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture) +
         ",\"resets_at\":" + resetsAt.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}";
 
-    public string TokenCount(decimal usedPercent, int windowMinutes, long resetsAt, string? secondary) =>
-        "{\"timestamp\":\"2026-08-23T01:41:44Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"limit_id\":\"codex\",\"limit_name\":\"Codex\",\"plan_type\":\"plus\",\"primary\":" +
+    public string TokenCount(decimal usedPercent, int windowMinutes, long resetsAt, string? secondary, string timestamp = "2026-08-23T01:41:44Z") =>
+        "{\"timestamp\":\"" + timestamp + "\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"limit_id\":\"codex\",\"limit_name\":\"Codex\",\"plan_type\":\"plus\",\"primary\":" +
         Window(usedPercent, windowMinutes, resetsAt) + ",\"secondary\":" + (secondary ?? "null") + "}}}";
 
     public string NullRateLimits() =>
