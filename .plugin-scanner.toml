@@ -1,0 +1,5 @@
+[scanner]
+# Self-contained .NET binaries are distributed with the Windows plugin. The
+# scanner cannot inspect their compiled contents and its text-secret heuristic
+# produces false positives; source files remain in scope.
+ignore_paths = ["**/*.exe", "**/*.dll"]
