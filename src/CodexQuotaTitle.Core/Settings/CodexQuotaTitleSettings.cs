@@ -164,14 +164,37 @@ public sealed class CodexQuotaTitleSettingsStore
         var placeholderComments = string.Join(
             Environment.NewLine,
             QuotaTemplateRenderer.SupportedPlaceholders.Select(placeholder => string.Concat("// ", placeholder)));
+        var serializedSettings = AddDateFormatDocumentation(JsonSerializer.Serialize(settings, SerializerOptions));
         var contents = string.Concat(
             "// CodexQuotaTitle supported placeholders:",
             Environment.NewLine,
             placeholderComments,
             Environment.NewLine,
             Environment.NewLine,
-            JsonSerializer.Serialize(settings, SerializerOptions));
+            serializedSettings);
         WriteAtomically(contents);
+    }
+
+    private static string AddDateFormatDocumentation(string serializedSettings)
+    {
+        const string dateFormatProperty = "  \"dateFormat\":";
+        var dateFormatIndex = serializedSettings.IndexOf(dateFormatProperty, StringComparison.Ordinal);
+        if (dateFormatIndex < 0)
+        {
+            throw new InvalidOperationException("The default dateFormat property could not be documented.");
+        }
+
+        var comments = string.Join(
+            Environment.NewLine,
+            "  // dateFormat controls the formatting of reset date placeholders:",
+            "  // %5h_reset_date%, %week_reset_date%, %primary_reset_date%, %secondary_reset_date%",
+            "  // It uses .NET custom date/time format strings.",
+            "  // Examples:",
+            "  // \"dd/MM HH:mm\"      -> 28/08 23:45",
+            "  // \"yyyy-MM-dd HH:mm\" -> 2026-08-28 23:45",
+            "  // \"MM/dd h:mm tt\"    -> 08/28 11:45 PM",
+            string.Empty);
+        return serializedSettings.Insert(dateFormatIndex, comments);
     }
 
     private void WriteAtomically(string contents)

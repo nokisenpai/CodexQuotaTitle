@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using CodexQuotaTitle.Accounts;
 using CodexQuotaTitle.AppServer;
 using CodexQuotaTitle.Profiles;
 using CodexQuotaTitle.Quotas;
@@ -9,22 +8,6 @@ using CodexQuotaTitle.Titles;
 using CodexQuotaTitle.Windows;
 
 namespace CodexQuotaTitle.Mcp;
-
-public interface IHelperAppServerSession : IAsyncDisposable
-{
-    event EventHandler<QuotaSnapshot>? RateLimitsUpdated;
-
-    Task<CodexAccountSummary> ReadAccountAsync(CancellationToken cancellationToken);
-
-    Task<QuotaReadResult> ReadRateLimitsAsync(CancellationToken cancellationToken);
-}
-
-public interface IHelperAppServerSessionFactory
-{
-    Task<IHelperAppServerSession> StartAsync(CodexAppServerLaunchRequest request, CancellationToken cancellationToken);
-}
-
-public sealed record CodexAppServerLaunchRequest(string CodexHome, string Executable);
 
 public interface IHostProcessLifetime
 {
@@ -40,7 +23,8 @@ public sealed record McpHelperServiceRunResult(bool AcquiredProfileSingleton, He
 
 public sealed class McpHelperService
 {
-    public const string HelperVersion = "0.1.7";
+    public const string HelperVersion = "0.1.8";
+    private readonly HelperAppServerConnector _appServerConnector;
     private readonly IHostProcessLifetime _hostProcessLifetime;
     private readonly IHostWindowProvider _hostWindowProvider;
     private readonly ICodexQuotaTitleSettingsStoreFactory _settingsStoreFactory;
@@ -58,8 +42,13 @@ public sealed class McpHelperService
         IAutomaticTitleUpdateService? titleUpdateService = null,
         QuotaTemplateRenderer? templateRenderer = null,
         TimeSpan? refreshInterval = null,
-        IRolloutQuotaSourceFactory? rolloutQuotaSourceFactory = null)
+        IRolloutQuotaSourceFactory? rolloutQuotaSourceFactory = null,
+        IHelperAppServerSessionFactory? appServerSessionFactory = null,
+        ICodexAppServerExecutableResolver? appServerExecutableResolver = null)
     {
+        _appServerConnector = new HelperAppServerConnector(
+            appServerSessionFactory ?? new CodexHelperAppServerSessionFactory(),
+            appServerExecutableResolver ?? new CodexAppServerExecutableResolver());
         _hostProcessLifetime = hostProcessLifetime ?? new ProcessHostLifetime();
         _hostWindowProvider = hostWindowProvider ?? new WindowsHostWindowProvider();
         _settingsStoreFactory = settingsStoreFactory ?? new CodexQuotaTitleSettingsStoreFactory();
@@ -71,7 +60,7 @@ public sealed class McpHelperService
     }
 
     public McpHelperService(
-        IHelperAppServerSessionFactory? ignoredAppServerSessionFactory,
+        IHelperAppServerSessionFactory? appServerSessionFactory,
         IHostProcessLifetime? hostProcessLifetime = null,
         IHostWindowProvider? hostWindowProvider = null,
         ICodexQuotaTitleSettingsStoreFactory? settingsStoreFactory = null,
@@ -87,10 +76,10 @@ public sealed class McpHelperService
             settingsChangeWatcherFactory,
             titleUpdateService,
             templateRenderer,
-            refreshInterval)
+            refreshInterval,
+            appServerSessionFactory: appServerSessionFactory,
+            appServerExecutableResolver: appServerExecutableResolver)
     {
-        _ = ignoredAppServerSessionFactory;
-        _ = appServerExecutableResolver;
     }
 
     public async Task<McpHelperServiceRunResult> RunAsync(
@@ -124,20 +113,66 @@ public sealed class McpHelperService
             log.TryAppend($"HOST_CODEX_PID={request.HostCodexPid}");
         }
 
+        IHelperAppServerSession? appServerSession = null;
+        using var quotaNotificationSignal = new SemaphoreSlim(0, 1);
+        var quotaNotificationGate = new object();
+        QuotaSnapshot? latestQuotaNotification = null;
+        EventHandler<QuotaSnapshot>? quotaNotificationHandler = null;
         try
         {
             using var quotaSource = _rolloutQuotaSourceFactory.Create(request.Profile);
             using var settingsWatcher = _settingsChangeWatcherFactory.Create(settingsStore.Paths);
-            state = RefreshQuotas(state, quotaSource, stateStore, log, "startup");
-            state = RefreshTitle(state, request, settingsStore, stateStore, log, "startup");
+            state = RefreshRolloutQuotas(state, quotaSource, stateStore, log, "startup", allowReplacement: true);
+            state = RefreshTitle(state, request, settingsStore, stateStore, log, "startup-rollout");
+
+            var appServerStart = await TryStartAppServerAsync(
+                request,
+                state,
+                stateStore,
+                log,
+                hostExitTask,
+                cancellationToken);
+            state = appServerStart.State;
+            appServerSession = appServerStart.Session;
+            if (appServerStart.HostExited)
+            {
+                log.TryAppend("HELPER_SERVICE_STOPPED_HOST_CHATGPT_EXITED");
+            }
+
+            if (appServerSession is not null)
+            {
+                quotaNotificationHandler = (_, snapshot) =>
+                {
+                    lock (quotaNotificationGate)
+                    {
+                        latestQuotaNotification = snapshot;
+                    }
+
+                    try
+                    {
+                        quotaNotificationSignal.Release();
+                    }
+                    catch (SemaphoreFullException)
+                    {
+                        // The newest notification is retained; one refresh is sufficient.
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // The helper is shutting down.
+                    }
+                };
+                appServerSession.RateLimitsUpdated += quotaNotificationHandler;
+                state = RefreshTitle(state, request, settingsStore, stateStore, log, "startup-app-server");
+            }
 
             while (!cancellationToken.IsCancellationRequested)
             {
                 using var waitCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 var periodicTask = Task.Delay(_refreshInterval, waitCancellation.Token);
                 var settingsTask = settingsWatcher.WaitForChangeAsync(waitCancellation.Token);
-                var quotaTask = quotaSource.WaitForChangeAsync(waitCancellation.Token);
-                var completed = await Task.WhenAny(hostExitTask, periodicTask, settingsTask, quotaTask);
+                var rolloutTask = quotaSource.WaitForChangeAsync(waitCancellation.Token);
+                var notificationTask = quotaNotificationSignal.WaitAsync(waitCancellation.Token);
+                var completed = await Task.WhenAny(hostExitTask, periodicTask, settingsTask, rolloutTask, notificationTask);
                 waitCancellation.Cancel();
 
                 if (completed == hostExitTask)
@@ -154,15 +189,71 @@ public sealed class McpHelperService
                     continue;
                 }
 
-                if (completed == quotaTask)
+                if (completed == rolloutTask)
                 {
-                    await quotaTask;
-                    state = RefreshQuotas(state, quotaSource, stateStore, log, "watcher");
+                    await rolloutTask;
+                    state = RefreshRolloutQuotas(
+                        state,
+                        quotaSource,
+                        stateStore,
+                        log,
+                        "watcher",
+                        allowReplacement: appServerSession is null);
                     state = RefreshTitle(state, request, settingsStore, stateStore, log, "rollout-change");
                     continue;
                 }
 
-                state = RefreshQuotas(state, quotaSource, stateStore, log, "periodic-resync");
+                if (completed == notificationTask)
+                {
+                    QuotaSnapshot? notification;
+                    lock (quotaNotificationGate)
+                    {
+                        notification = latestQuotaNotification;
+                        latestQuotaNotification = null;
+                    }
+
+                    if (notification is not null)
+                    {
+                        state = ApplyAppServerNotification(state, notification, stateStore, log);
+                    }
+
+                    state = RefreshTitle(state, request, settingsStore, stateStore, log, "rate-limits-notification");
+                    continue;
+                }
+
+                if (appServerSession is not null)
+                {
+                    try
+                    {
+                        using var refreshTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        refreshTimeout.CancelAfter(TimeSpan.FromSeconds(20));
+                        var quotas = await appServerSession.ReadRateLimitsAsync(refreshTimeout.Token);
+                        state = ApplyAppServerQuotas(state, quotas, stateStore, log, "periodic-resync");
+                    }
+                    catch (Exception exception) when (
+                        exception is not OperationCanceledException ||
+                        !cancellationToken.IsCancellationRequested)
+                    {
+                        state = CreateAppServerFailureState(state, "failed", exception);
+                        stateStore.Write(state);
+                        log.AppendException("RATE_LIMITS_PERIODIC_RESYNC_FAILED", exception);
+                        if (quotaNotificationHandler is not null)
+                        {
+                            appServerSession.RateLimitsUpdated -= quotaNotificationHandler;
+                        }
+
+                        await DisposeAppServerSessionAsync(appServerSession, log);
+                        appServerSession = null;
+                    }
+                }
+
+                state = RefreshRolloutQuotas(
+                    state,
+                    quotaSource,
+                    stateStore,
+                    log,
+                    "periodic-resync",
+                    allowReplacement: appServerSession is null);
                 state = RefreshTitle(state, request, settingsStore, stateStore, log, "periodic");
             }
         }
@@ -179,12 +270,22 @@ public sealed class McpHelperService
                 UpdatedAtUtc = DateTimeOffset.UtcNow,
             };
             stateStore.Write(state);
-            log.AppendException("ROLLOUT_QUOTA_SOURCE_FAILED", exception);
+            log.AppendException("QUOTA_REFRESH_FAILED", exception);
         }
         finally
         {
             hostLifetimeCancellation.Cancel();
             state = CleanupTitle(state, request, settingsStore, stateStore, log);
+            if (appServerSession is not null)
+            {
+                if (quotaNotificationHandler is not null)
+                {
+                    appServerSession.RateLimitsUpdated -= quotaNotificationHandler;
+                }
+
+                await DisposeAppServerSessionAsync(appServerSession, log);
+            }
+
             state = state with
             {
                 IsRunning = false,
@@ -197,27 +298,205 @@ public sealed class McpHelperService
         return new McpHelperServiceRunResult(true, state);
     }
 
-    private static HelperRuntimeState RefreshQuotas(
+    private async Task<AppServerStartResult> TryStartAppServerAsync(
+        McpHelperStartupRequest request,
         HelperRuntimeState state,
-        IRolloutQuotaSource quotaSource,
+        HelperRuntimeStateStore stateStore,
+        HelperServiceLog log,
+        Task hostExitTask,
+        CancellationToken cancellationToken)
+    {
+        var result = await _appServerConnector.ConnectAsync(request, hostExitTask, cancellationToken);
+        if (result.ExecutableResolution is { } resolution)
+        {
+            state = state with
+            {
+                AppServerExecutableSource = resolution.Source,
+                AppServerExecutableAvailable = resolution.Available,
+                UpdatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            stateStore.Write(state);
+            log.TryAppend(
+                $"APP_SERVER_EXECUTABLE_SOURCE={resolution.Source} " +
+                $"AVAILABLE={resolution.Available.ToString().ToUpperInvariant()}");
+        }
+
+        if (result.HostExited)
+        {
+            return new AppServerStartResult(null, state, true);
+        }
+
+        if (!result.Connected)
+        {
+            var failure = result.Status == "timed-out"
+                ? new OperationCanceledException("The Codex App Server startup timed out.")
+                : result.Failure ?? new CodexAppServerException("The Codex App Server is unavailable.");
+            state = CreateAppServerFailureState(state, result.Status, failure);
+            stateStore.Write(state);
+            if (result.Status == "timed-out")
+            {
+                log.TryAppend("APP_SERVER_TIMED_OUT");
+            }
+            else
+            {
+                log.AppendException(
+                    result.Status == "unavailable" ? "APP_SERVER_UNAVAILABLE" : "APP_SERVER_FAILED",
+                    failure);
+            }
+
+            return new AppServerStartResult(null, state, false);
+        }
+
+        log.TryAppend("APP_SERVER_INITIALIZED");
+        state = ApplyAppServerQuotas(state, result.Quotas!, stateStore, log, "startup");
+        if (result.Account is { } account)
+        {
+            state = state with
+            {
+                Account = new HelperAccountDiagnostic(account.Type, account.PlanType, account.RequiresOpenAiAuth),
+                UpdatedAtUtc = DateTimeOffset.UtcNow,
+            };
+            stateStore.Write(state);
+            log.TryAppend("ACCOUNT_READ_OK");
+        }
+        else if (result.AccountFailure is not null)
+        {
+            log.AppendException("ACCOUNT_READ_FAILED", result.AccountFailure);
+        }
+
+        return new AppServerStartResult(result.Session, state, false);
+    }
+
+    private static HelperRuntimeState ApplyAppServerQuotas(
+        HelperRuntimeState state,
+        QuotaReadResult quotas,
         HelperRuntimeStateStore stateStore,
         HelperServiceLog log,
         string trigger)
     {
-        var result = quotaSource.Refresh();
         state = state with
         {
-            QuotaSource = "rollout",
-            QuotaSourceStatus = result.Status,
-            QuotaSelection = result.QuotaSelection,
-            ActiveSessionId = result.ActiveSessionId,
-            RolloutAvailable = result.RolloutAvailable,
-            Quotas = result.Quotas is null ? Array.Empty<HelperQuotaSnapshot>() : ToRuntimeQuotas(result.Quotas),
-            LastQuotaUpdatedAtUtc = result.LastQuotaUpdatedAtUtc,
+            QuotaSource = "app-server",
+            QuotaSourceStatus = "connected",
+            QuotaSelection = null,
+            Quotas = ToRuntimeQuotas(quotas),
+            LastQuotaUpdatedAtUtc = DateTimeOffset.UtcNow,
+            AppServerConnected = true,
+            AppServerStatus = "connected",
+            AppServerLastError = null,
+            AppServerLastExceptionType = null,
             UpdatedAtUtc = DateTimeOffset.UtcNow,
         };
         stateStore.Write(state);
-        log.TryAppend($"ROLLOUT_QUOTA_SOURCE_TRIGGER={trigger} STATUS={result.Status}");
+        log.TryAppend($"APP_SERVER_QUOTA_SOURCE_TRIGGER={trigger} STATUS=connected");
+        return state;
+    }
+
+    private static HelperRuntimeState ApplyAppServerNotification(
+        HelperRuntimeState state,
+        QuotaSnapshot notification,
+        HelperRuntimeStateStore stateStore,
+        HelperServiceLog log)
+    {
+        var runtimeNotification = ToRuntimeQuota(notification);
+        var quotas = state.Quotas.ToList();
+        var matchingIndex = string.IsNullOrWhiteSpace(runtimeNotification.LimitId)
+            ? (quotas.Count == 1 ? 0 : -1)
+            : quotas.FindIndex(item =>
+                string.Equals(item.LimitId, runtimeNotification.LimitId, StringComparison.Ordinal));
+        if (matchingIndex >= 0)
+        {
+            quotas[matchingIndex] = runtimeNotification;
+        }
+        else
+        {
+            quotas.Add(runtimeNotification);
+        }
+
+        state = state with
+        {
+            QuotaSource = "app-server",
+            QuotaSourceStatus = "connected",
+            QuotaSelection = null,
+            Quotas = quotas,
+            LastQuotaUpdatedAtUtc = DateTimeOffset.UtcNow,
+            AppServerConnected = true,
+            AppServerStatus = "connected",
+            AppServerLastError = null,
+            AppServerLastExceptionType = null,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+        };
+        stateStore.Write(state);
+        log.TryAppend("APP_SERVER_QUOTA_SOURCE_TRIGGER=notification STATUS=connected");
+        return state;
+    }
+
+    private static HelperRuntimeState CreateAppServerFailureState(
+        HelperRuntimeState state,
+        string appServerStatus,
+        Exception exception) =>
+        state with
+        {
+            AppServerConnected = false,
+            AppServerStatus = appServerStatus,
+            AppServerLastError = DiagnosticMessageSanitizer.Sanitize(exception.Message),
+            AppServerLastExceptionType = exception.GetType().Name,
+            QuotaSourceStatus = string.Equals(state.QuotaSource, "app-server", StringComparison.Ordinal)
+                ? "stale"
+                : state.QuotaSourceStatus,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+        };
+
+    private static async ValueTask DisposeAppServerSessionAsync(
+        IHelperAppServerSession session,
+        HelperServiceLog log)
+    {
+        try
+        {
+            await session.DisposeAsync();
+        }
+        catch (Exception exception)
+        {
+            log.AppendException("APP_SERVER_DISPOSE_FAILED", exception);
+        }
+    }
+
+    private sealed record AppServerStartResult(
+        IHelperAppServerSession? Session,
+        HelperRuntimeState State,
+        bool HostExited);
+
+    private static HelperRuntimeState RefreshRolloutQuotas(
+        HelperRuntimeState state,
+        IRolloutQuotaSource quotaSource,
+        HelperRuntimeStateStore stateStore,
+        HelperServiceLog log,
+        string trigger,
+        bool allowReplacement)
+    {
+        var result = quotaSource.Refresh();
+        var rolloutIsNewer = result.LastQuotaUpdatedAtUtc is not null &&
+                             (state.LastQuotaUpdatedAtUtc is null ||
+                              result.LastQuotaUpdatedAtUtc > state.LastQuotaUpdatedAtUtc);
+        var replaceQuotas = result.Quotas is not null &&
+                            (state.Quotas.Count == 0 ||
+                             !string.Equals(state.QuotaSource, "app-server", StringComparison.Ordinal) ||
+                             (allowReplacement && rolloutIsNewer));
+        state = state with
+        {
+            QuotaSource = replaceQuotas ? "rollout" : state.QuotaSource,
+            QuotaSourceStatus = replaceQuotas ? result.Status : state.QuotaSourceStatus,
+            QuotaSelection = replaceQuotas ? result.QuotaSelection : state.QuotaSelection,
+            ActiveSessionId = result.ActiveSessionId,
+            RolloutAvailable = result.RolloutAvailable,
+            Quotas = replaceQuotas ? ToRuntimeQuotas(result.Quotas!) : state.Quotas,
+            LastQuotaUpdatedAtUtc = replaceQuotas ? result.LastQuotaUpdatedAtUtc : state.LastQuotaUpdatedAtUtc,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+        };
+        stateStore.Write(state);
+        log.TryAppend(
+            $"ROLLOUT_QUOTA_SOURCE_TRIGGER={trigger} STATUS={result.Status} " +
+            $"APPLIED={replaceQuotas.ToString().ToUpperInvariant()}");
         return state;
     }
 
@@ -368,12 +647,15 @@ public sealed class McpHelperService
     private static IReadOnlyList<HelperQuotaSnapshot> ToRuntimeQuotas(QuotaReadResult quotas) =>
         quotas.AllSnapshots()
             .Distinct()
-            .Select(snapshot => new HelperQuotaSnapshot(
-                snapshot.LimitId,
-                snapshot.LimitName,
-                ToRuntimeWindow(snapshot.Primary),
-                ToRuntimeWindow(snapshot.Secondary)))
+            .Select(ToRuntimeQuota)
             .ToList();
+
+    private static HelperQuotaSnapshot ToRuntimeQuota(QuotaSnapshot snapshot) =>
+        new(
+            snapshot.LimitId,
+            snapshot.LimitName,
+            ToRuntimeWindow(snapshot.Primary),
+            ToRuntimeWindow(snapshot.Secondary));
 
     private static HelperQuotaWindow? ToRuntimeWindow(RateLimitWindow? window) =>
         window is null

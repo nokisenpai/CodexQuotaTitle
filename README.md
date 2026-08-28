@@ -26,7 +26,7 @@ Development uses the local marketplace already configured on the developer machi
 
 ## Automatic quota updates
 
-The helper starts automatically when a Codex Desktop task/session is opened or resumed. It keeps the title current from Codex App Server rate-limit updates, with a periodic resynchronization as a fallback. It updates a title only when it can correlate exactly one visible Codex Desktop window to the Desktop host process. If correlation is ambiguous, the title is left unchanged.
+The helper starts automatically when a Codex Desktop task/session is opened or resumed. It uses Codex App Server rate-limit updates and periodic resynchronization when App Server is available. If App Server cannot start or later becomes unavailable, the helper falls back to the newest profile-scoped quota snapshot from Codex session rollouts without discarding a newer App Server value. It updates a title only when it can correlate exactly one visible Codex Desktop window to the Desktop host process. If correlation is ambiguous, the title is left unchanged.
 
 ## Profile behavior
 
@@ -89,7 +89,7 @@ The plugin contains no custom telemetry, analytics SDK, HTTP client, or remote u
 
 - Windows and Codex Desktop are required; macOS and Linux are not supported.
 - The plugin updates only one visible, unambiguously correlated Codex Desktop window. It does nothing when there are zero or multiple candidate windows.
-- Codex Desktop must allow the bundled MCP and provide a usable Codex App Server for the active profile.
+- Codex Desktop must allow the bundled MCP. A usable Codex App Server provides the freshest values; session rollout snapshots are used as a fallback when it is unavailable.
 - The rendered quota text depends on the quotas returned by the current Codex account; unavailable values display as `—`.
 - Settings are local to the Windows user and the resolved Codex profile.
 

@@ -1,6 +1,9 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
 using CodexQuotaTitle.AppServer;
+using Microsoft.Win32.SafeHandles;
 
 namespace CodexQuotaTitle.Mcp;
 
@@ -8,7 +11,9 @@ public sealed record CodexAppServerExecutableResolution(string Executable, strin
 
 public interface IHostCodexExecutablePathProvider
 {
-    string? TryGetExecutablePath(int processId);
+    string? TryGetExecutablePathWithQuery(int processId);
+
+    string? TryGetExecutablePathWithMainModule(int processId);
 }
 
 public interface ICodexAppServerExecutableResolver
@@ -18,7 +23,30 @@ public interface ICodexAppServerExecutableResolver
 
 public sealed class HostCodexExecutablePathProvider : IHostCodexExecutablePathProvider
 {
-    public string? TryGetExecutablePath(int processId)
+    private const uint ProcessQueryLimitedInformation = 0x1000;
+    private const int MaximumProcessImagePathLength = 32768;
+
+    public string? TryGetExecutablePathWithQuery(int processId)
+    {
+        if (!OperatingSystem.IsWindows() || processId <= 0)
+        {
+            return null;
+        }
+
+        using var processHandle = OpenProcess(ProcessQueryLimitedInformation, inheritHandle: false, processId);
+        if (processHandle.IsInvalid)
+        {
+            return null;
+        }
+
+        var path = new StringBuilder(MaximumProcessImagePathLength);
+        var pathLength = (uint)path.Capacity;
+        return QueryFullProcessImageName(processHandle, flags: 0, path, ref pathLength) && pathLength > 0
+            ? path.ToString(0, checked((int)pathLength))
+            : null;
+    }
+
+    public string? TryGetExecutablePathWithMainModule(int processId)
     {
         if (!OperatingSystem.IsWindows() || processId <= 0)
         {
@@ -52,6 +80,20 @@ public sealed class HostCodexExecutablePathProvider : IHostCodexExecutablePathPr
             return null;
         }
     }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern SafeProcessHandle OpenProcess(
+        uint desiredAccess,
+        [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
+        int processId);
+
+    [DllImport("kernel32.dll", EntryPoint = "QueryFullProcessImageNameW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool QueryFullProcessImageName(
+        SafeProcessHandle processHandle,
+        uint flags,
+        [Out] StringBuilder executablePath,
+        ref uint executablePathLength);
 }
 
 public sealed class CodexAppServerExecutableResolver : ICodexAppServerExecutableResolver
@@ -71,29 +113,20 @@ public sealed class CodexAppServerExecutableResolver : ICodexAppServerExecutable
     {
         if (hostCodexPid is > 0)
         {
-            try
+            var queryExecutable = TryResolveHostExecutable(
+                hostCodexPid.Value,
+                _hostPathProvider.TryGetExecutablePathWithQuery);
+            if (IsAvailableAbsolutePath(queryExecutable))
             {
-                var hostExecutable = _hostPathProvider.TryGetExecutablePath(hostCodexPid.Value);
-                if (IsAvailableAbsolutePath(hostExecutable))
-                {
-                    return new CodexAppServerExecutableResolution(hostExecutable!, "host-process", true);
-                }
+                return new CodexAppServerExecutableResolution(queryExecutable!, "host-process-query", true);
             }
-            catch (ArgumentException)
+
+            var mainModuleExecutable = TryResolveHostExecutable(
+                hostCodexPid.Value,
+                _hostPathProvider.TryGetExecutablePathWithMainModule);
+            if (IsAvailableAbsolutePath(mainModuleExecutable))
             {
-                // The host process may have exited between process-tree inspection and resolution.
-            }
-            catch (InvalidOperationException)
-            {
-                // Access to process metadata can become invalid while the host is shutting down.
-            }
-            catch (Win32Exception)
-            {
-                // Some Windows process handles do not allow MainModule inspection.
-            }
-            catch (UnauthorizedAccessException)
-            {
-                // Restricted process inspection falls back to the normal Codex resolver.
+                return new CodexAppServerExecutableResolution(mainModuleExecutable!, "host-process-mainmodule", true);
             }
         }
 
@@ -103,6 +136,36 @@ public sealed class CodexAppServerExecutableResolver : ICodexAppServerExecutable
             fallbackExecutable,
             fallbackAvailable ? "path" : "fallback",
             fallbackAvailable);
+    }
+
+    private static string? TryResolveHostExecutable(
+        int processId,
+        Func<int, string?> resolve)
+    {
+        try
+        {
+            return resolve(processId);
+        }
+        catch (ArgumentException)
+        {
+            // The host process may have exited between process-tree inspection and resolution.
+            return null;
+        }
+        catch (InvalidOperationException)
+        {
+            // Access to process metadata can become invalid while the host is shutting down.
+            return null;
+        }
+        catch (Win32Exception)
+        {
+            // Some Windows process handles do not allow the requested image-path inspection.
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Restricted process inspection continues with the next compatible resolver.
+            return null;
+        }
     }
 
     private static bool IsAvailableAbsolutePath(string? executable) =>

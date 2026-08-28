@@ -76,10 +76,16 @@ var tests = new (string Name, Action Execute)[]
     ("Concurrent MCP bootstraps start one helper for one profile", () => McpBootstrapperSerializesConcurrentStarts().GetAwaiter().GetResult()),
     ("MCP replaces a stale dead helper runtime state", McpBootstrapperReplacesStaleState),
     ("MCP can start distinct helpers for distinct profiles", () => McpBootstrapperAllowsDistinctProfiles().GetAwaiter().GetResult()),
-    ("App Server executable resolution prioritizes the host process", AppServerExecutableResolutionPrioritizesHostProcess),
+    ("App Server executable resolution uses QueryFullProcessImageName before MainModule", AppServerExecutableResolutionUsesQueryBeforeMainModule),
     ("App Server executable resolution falls back safely", AppServerExecutableResolutionFallsBackSafely),
     ("Helper uses rollout quotas and exits with the host", () => McpHelperServiceUsesRolloutAndHostLifecycle().GetAwaiter().GetResult()),
+    ("Helper uses rollout quotas when App Server cannot start", () => McpHelperServiceUsesRolloutWhenAppServerCannotStart().GetAwaiter().GetResult()),
     ("Helper uses profile fallback without SessionStart", () => McpHelperServiceUsesProfileFallbackWithoutSessionStart().GetAwaiter().GetResult()),
+    ("Helper prefers App Server quotas over a stale rollout", () => McpHelperServicePrefersAppServerOverStaleRollout().GetAwaiter().GetResult()),
+    ("Helper records App Server startup diagnostics", () => McpHelperServiceRecordsAppServerStartupDiagnostics().GetAwaiter().GetResult()),
+    ("MCP status retains App Server diagnostics", McpHelperStatusRetainsAppServerDiagnostics),
+    ("Helper refreshes after an App Server quota notification", () => McpHelperRefreshesAfterQuotaNotification().GetAwaiter().GetResult()),
+    ("Helper periodically resynchronizes App Server quotas", () => McpHelperPerformsPeriodicQuotaFallback().GetAwaiter().GetResult()),
     ("MCP status retains rollout runtime diagnostics", McpHelperStatusRetainsRolloutDiagnostics),
     ("Helper cleanup restores the base after a fully custom title", () => McpHelperCleanupRestoresBaseAfterFullyCustomTitle().GetAwaiter().GetResult()),
     ("MCP stdio server completes the bootstrap handshake and status call", () => McpStdioServerCompletesBootstrapHandshake().GetAwaiter().GetResult()),
@@ -210,11 +216,28 @@ static void SettingsCreateProfileDefaultsAtomically()
 {
     using var fixture = new SettingsFixture();
     var result = fixture.Store.LoadOrCreate();
+    var contents = File.ReadAllText(fixture.Store.Paths.SettingsPath);
+    var documentedDateFormat = string.Join(
+        Environment.NewLine,
+        "  // dateFormat controls the formatting of reset date placeholders:",
+        "  // %5h_reset_date%, %week_reset_date%, %primary_reset_date%, %secondary_reset_date%",
+        "  // It uses .NET custom date/time format strings.",
+        "  // Examples:",
+        "  // \"dd/MM HH:mm\"      -> 28/08 23:45",
+        "  // \"yyyy-MM-dd HH:mm\" -> 2026-08-28 23:45",
+        "  // \"MM/dd h:mm tt\"    -> 08/28 11:45 PM",
+        "  \"dateFormat\": \"dd/MM HH:mm\",");
 
     AssertTrue(result.UsedDefaults, "Defaults were not used for a new profile.");
     AssertEqual(CodexQuotaTitleSettings.DefaultTemplate, result.Settings.Template);
+    AssertEqual(CodexQuotaTitleSettings.DefaultDateFormat, result.Settings.DateFormat);
     AssertTrue(File.Exists(fixture.Store.Paths.SettingsPath), "The default settings file was not created.");
     AssertTrue(!Directory.EnumerateFiles(fixture.Store.Paths.DirectoryPath, "*.tmp").Any(), "Atomic settings creation left a temporary file.");
+    AssertContains(contents, documentedDateFormat);
+
+    var reloaded = fixture.Store.LoadOrCreate();
+    AssertTrue(!reloaded.UsedDefaults, "The generated JSONC documentation made the settings unreadable.");
+    AssertEqual(CodexQuotaTitleSettings.DefaultDateFormat, reloaded.Settings.DateFormat);
 }
 
 static void SettingsPersistTemplateChangesPerProfile()
@@ -1157,30 +1180,28 @@ static async Task McpBootstrapperAllowsDistinctProfiles()
     }
 }
 
-static void AppServerExecutableResolutionPrioritizesHostProcess()
+static void AppServerExecutableResolutionUsesQueryBeforeMainModule()
 {
-    var directoryPath = Path.Combine(Path.GetTempPath(), "cqt-app-server-executable-tests", Guid.NewGuid().ToString("N"));
-    Directory.CreateDirectory(directoryPath);
-    try
+    if (!OperatingSystem.IsWindows())
     {
-        var hostExecutable = Path.Combine(directoryPath, "host-codex.exe");
-        var fallbackExecutable = Path.Combine(directoryPath, "path-codex.exe");
-        File.WriteAllText(hostExecutable, string.Empty);
-        File.WriteAllText(fallbackExecutable, string.Empty);
-        var resolver = new CodexAppServerExecutableResolver(
-            new TestHostCodexExecutablePathProvider(_ => hostExecutable),
-            _ => fallbackExecutable);
-
-        var resolution = resolver.Resolve(222);
-
-        AssertEqual(hostExecutable, resolution.Executable);
-        AssertEqual("host-process", resolution.Source);
-        AssertTrue(resolution.Available, "The executable from the host process was not marked available.");
+        return;
     }
-    finally
-    {
-        Directory.Delete(directoryPath, recursive: true);
-    }
+
+    var nativeProvider = new HostCodexExecutablePathProvider();
+    var provider = new TestHostCodexExecutablePathProvider(
+        nativeProvider.TryGetExecutablePathWithQuery,
+        _ => throw new UnauthorizedAccessException("MainModule is unavailable."));
+    var resolver = new CodexAppServerExecutableResolver(
+        provider,
+        _ => throw new InvalidOperationException("The host-process query should take priority."));
+
+    var resolution = resolver.Resolve(Environment.ProcessId);
+
+    AssertEqual("host-process-query", resolution.Source);
+    AssertTrue(resolution.Available, "QueryFullProcessImageName did not resolve the current executable.");
+    AssertTrue(File.Exists(resolution.Executable), "QueryFullProcessImageName returned an unavailable executable.");
+    AssertTrue(provider.QueryCallCount == 1, "The host-process query was not attempted exactly once.");
+    AssertTrue(provider.MainModuleCallCount == 0, "MainModule was used despite a successful host-process query.");
 }
 
 static void AppServerExecutableResolutionFallsBackSafely()
@@ -1190,7 +1211,19 @@ static void AppServerExecutableResolutionFallsBackSafely()
     try
     {
         var fallbackExecutable = Path.Combine(directoryPath, "path-codex.exe");
+        var mainModuleExecutable = Path.Combine(directoryPath, "mainmodule-codex.exe");
         File.WriteAllText(fallbackExecutable, string.Empty);
+        File.WriteAllText(mainModuleExecutable, string.Empty);
+
+        var mainModuleResolver = new CodexAppServerExecutableResolver(
+            new TestHostCodexExecutablePathProvider(
+                _ => null,
+                _ => mainModuleExecutable),
+            _ => fallbackExecutable);
+        var mainModule = mainModuleResolver.Resolve(222);
+        AssertEqual(mainModuleExecutable, mainModule.Executable);
+        AssertEqual("host-process-mainmodule", mainModule.Source);
+        AssertTrue(mainModule.Available, "The MainModule compatibility fallback was not marked available.");
 
         var absentHostResolver = new CodexAppServerExecutableResolver(
             new TestHostCodexExecutablePathProvider(_ => null),
@@ -1203,7 +1236,9 @@ static void AppServerExecutableResolutionFallsBackSafely()
         AssertEqual("path", dead.Source);
 
         var deniedHostResolver = new CodexAppServerExecutableResolver(
-            new TestHostCodexExecutablePathProvider(_ => throw new UnauthorizedAccessException()),
+            new TestHostCodexExecutablePathProvider(
+                _ => throw new System.ComponentModel.Win32Exception(),
+                _ => throw new UnauthorizedAccessException()),
             _ => fallbackExecutable);
         var denied = deniedHostResolver.Resolve(222);
         AssertEqual(fallbackExecutable, denied.Executable);
@@ -1223,6 +1258,17 @@ static void AppServerExecutableResolutionFallsBackSafely()
 }
 
 static async Task McpHelperServiceUsesRolloutAndHostLifecycle()
+{
+    await VerifyHelperUsesRolloutFallbackAsync(new FailingReadAndDisposeAppServerSessionFactory());
+}
+
+static async Task McpHelperServiceUsesRolloutWhenAppServerCannotStart()
+{
+    await VerifyHelperUsesRolloutFallbackAsync(
+        new FailingTestAppServerSessionFactory(new CodexAppServerException("Unable to start codex app-server.")));
+}
+
+static async Task VerifyHelperUsesRolloutFallbackAsync(IHelperAppServerSessionFactory appServerSessionFactory)
 {
     var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-rollout-helper-tests", Guid.NewGuid().ToString("N"), ".codex"));
     var runtimePaths = new HelperRuntimePaths(Path.Combine(Path.GetTempPath(), "cqt-rollout-helper-tests", Guid.NewGuid().ToString("N")));
@@ -1244,7 +1290,8 @@ static async Task McpHelperServiceUsesRolloutAndHostLifecycle()
             settingsFactory,
             new TestSettingsChangeWatcherFactory(),
             titleUpdater,
-            rolloutQuotaSourceFactory: new TestRolloutQuotaSourceFactory(source));
+            rolloutQuotaSourceFactory: new TestRolloutQuotaSourceFactory(source),
+            appServerSessionFactory: appServerSessionFactory);
 
         var run = service.RunAsync(new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths));
         await windowProvider.Enumerated.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -1283,7 +1330,9 @@ static async Task McpHelperServiceUsesProfileFallbackWithoutSessionStart()
             settingsFactory,
             new TestSettingsChangeWatcherFactory(),
             titleUpdater,
-            refreshInterval: TimeSpan.FromMilliseconds(50));
+            refreshInterval: TimeSpan.FromMilliseconds(50),
+            appServerSessionFactory: new FailingTestAppServerSessionFactory(
+                new CodexAppServerException("Unavailable for profile fallback test.")));
 
         var run = service.RunAsync(new McpHelperStartupRequest(fixture.Profile.RawCodexHome!, fixture.Profile, 333, 222, "mcp", runtimePaths));
         var stateStore = new HelperRuntimeStateStore(runtimePaths);
@@ -1294,6 +1343,61 @@ static async Task McpHelperServiceUsesProfileFallbackWithoutSessionStart()
         AssertTrue(runningState.ActiveSessionId is null, "The helper invented an active session during fallback.");
         AssertTrue(runningState.Quotas.Single().Primary?.WindowDurationMins == 10080, "The helper did not render profile fallback quotas.");
         AssertTrue(titleUpdater.Requests.Count > 0, "The helper did not update the title from profile fallback quotas.");
+
+        hostLifetime.Complete();
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static async Task McpHelperServicePrefersAppServerOverStaleRollout()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-hybrid-helper-tests", Guid.NewGuid().ToString("N"), ".codex"));
+    var runtimePaths = new HelperRuntimePaths(Path.Combine(Path.GetTempPath(), "cqt-hybrid-helper-tests", Guid.NewGuid().ToString("N")));
+    try
+    {
+        var hostLifetime = new TestHostProcessLifetime();
+        var appServerFactory = new TestAppServerSessionFactory();
+        var rolloutSource = new TestRolloutQuotaSource(new RolloutQuotaReadResult(
+            RolloutQuotaSourceStatuses.WatchingSession,
+            "session-stale",
+            true,
+            new QuotaReadResult(
+                new QuotaSnapshot(
+                    "codex",
+                    "Codex",
+                    new RateLimitWindow(81m, 300, DateTimeOffset.UtcNow.AddHours(1)),
+                    new RateLimitWindow(45m, 10080, DateTimeOffset.UtcNow.AddDays(4))),
+                new Dictionary<string, QuotaSnapshot>()),
+            DateTimeOffset.UtcNow.AddMinutes(-30),
+            QuotaSelection: RolloutQuotaSelections.ActiveSession));
+        var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(
+            new LocalAppDataSettingsPathResolver(Path.Combine(runtimePaths.DirectoryPath, "settings")));
+        var service = new McpHelperService(
+            hostLifetime,
+            new TestHostWindowProvider(),
+            settingsFactory,
+            new TestSettingsChangeWatcherFactory(),
+            new TestAutomaticTitleUpdateService(),
+            rolloutQuotaSourceFactory: new TestRolloutQuotaSourceFactory(rolloutSource),
+            appServerSessionFactory: appServerFactory,
+            appServerExecutableResolver: new CodexAppServerExecutableResolver(
+                new TestHostCodexExecutablePathProvider(_ => null),
+                _ => "codex"));
+
+        var run = service.RunAsync(new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths));
+        var stateStore = new HelperRuntimeStateStore(runtimePaths);
+        await WaitUntilAsync(
+            () => stateStore.TryRead() is { QuotaSource: "app-server", AppServerConnected: true },
+            TimeSpan.FromSeconds(5));
+        var state = stateStore.TryRead() ?? throw new InvalidOperationException("The hybrid helper did not persist runtime state.");
+        AssertEqual("app-server", state.QuotaSource);
+        AssertEquivalent(37m, state.Quotas.Single().Primary!.UsedPercent);
+        AssertEquivalent(12m, state.Quotas.Single().Secondary!.UsedPercent);
+        AssertTrue(state.LastQuotaUpdatedAtUtc > DateTimeOffset.UtcNow.AddMinutes(-1), "The authoritative quota timestamp was not refreshed.");
 
         hostLifetime.Complete();
         await run.WaitAsync(TimeSpan.FromSeconds(5));
@@ -1444,7 +1548,7 @@ static async Task McpHelperServiceUsesBootstrapHintsAndHostLifecycle()
         AssertEqual("connected", runningState.AppServerStatus);
         AssertTrue(runningState.AppServerLastError is null, "A successful App Server connection retained an error.");
         AssertTrue(runningState.AppServerLastExceptionType is null, "A successful App Server connection retained an exception type.");
-        AssertEqual("host-process", runningState.AppServerExecutableSource);
+        AssertEqual("host-process-query", runningState.AppServerExecutableSource);
         AssertTrue(runningState.AppServerExecutableAvailable == true, "The host executable was not recorded as available.");
         AssertTrue(runningState.Quotas.Count == 1, "The helper did not persist normalized quotas.");
         AssertTrue(runningState.CandidateWindowCount == 2, "The helper did not persist all top-level host windows.");
@@ -1625,7 +1729,9 @@ static async Task McpHelperCleanupRestoresBaseAfterFullyCustomTitle()
             settingsFactory,
             new TestSettingsChangeWatcherFactory(),
             new AutomaticTitleUpdateService(titleWindow, ownership),
-            rolloutQuotaSourceFactory: new TestRolloutQuotaSourceFactory(quotaSource));
+            rolloutQuotaSourceFactory: new TestRolloutQuotaSourceFactory(quotaSource),
+            appServerSessionFactory: new FailingTestAppServerSessionFactory(
+                new CodexAppServerException("Unavailable for cleanup fallback test.")));
 
         var run = service.RunAsync(new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths));
         await WaitUntilAsync(() => ownership.IsFullyOwnedTitle(titleWindow.Title), TimeSpan.FromSeconds(2));
@@ -1653,9 +1759,15 @@ static async Task McpHelperRefreshesAfterQuotaNotification()
         var service = new McpHelperService(factory, hostLifetime, new TestHostWindowProvider(), settingsFactory, new TestSettingsChangeWatcherFactory(), titleUpdater, refreshInterval: TimeSpan.FromMinutes(1));
         var run = service.RunAsync(new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths));
         await factory.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(
+            () => new HelperRuntimeStateStore(runtimePaths).TryRead()?.AppServerConnected == true &&
+                  titleUpdater.Requests.Count >= 2,
+            TimeSpan.FromSeconds(5));
 
         factory.Session.PublishQuota(new QuotaSnapshot("codex", "Codex", new RateLimitWindow(55m, 300, DateTimeOffset.UtcNow.AddHours(1)), null));
-        await WaitUntilAsync(() => titleUpdater.Requests.Count >= 2, TimeSpan.FromSeconds(2));
+        await WaitUntilAsync(
+            () => new HelperRuntimeStateStore(runtimePaths).TryRead()?.Quotas.Single().Primary?.UsedPercent == 55m,
+            TimeSpan.FromSeconds(2));
         var state = new HelperRuntimeStateStore(runtimePaths).TryRead();
         AssertTrue(state is not null && state.Quotas.Single().Primary?.UsedPercent == 55m, "The quota notification did not update normalized helper state.");
 
@@ -2597,16 +2709,60 @@ file sealed class FailingTestAppServerSessionFactory : IHelperAppServerSessionFa
         Task.FromException<IHelperAppServerSession>(_exception);
 }
 
-file sealed class TestHostCodexExecutablePathProvider : IHostCodexExecutablePathProvider
+file sealed class FailingReadAndDisposeAppServerSessionFactory : IHelperAppServerSessionFactory
 {
-    private readonly Func<int, string?> _resolve;
+    public Task<IHelperAppServerSession> StartAsync(
+        CodexAppServerLaunchRequest request,
+        CancellationToken cancellationToken) =>
+        Task.FromResult<IHelperAppServerSession>(new FailingReadAndDisposeAppServerSession());
+}
 
-    public TestHostCodexExecutablePathProvider(Func<int, string?> resolve)
+file sealed class FailingReadAndDisposeAppServerSession : IHelperAppServerSession
+{
+    public event EventHandler<QuotaSnapshot>? RateLimitsUpdated
     {
-        _resolve = resolve;
+        add { }
+        remove { }
     }
 
-    public string? TryGetExecutablePath(int processId) => _resolve(processId);
+    public Task<CodexAccountSummary> ReadAccountAsync(CancellationToken cancellationToken) =>
+        throw new InvalidOperationException("Account read should not run after the quota read fails.");
+
+    public Task<QuotaReadResult> ReadRateLimitsAsync(CancellationToken cancellationToken) =>
+        Task.FromException<QuotaReadResult>(new CodexAppServerException("Quota read is unavailable."));
+
+    public ValueTask DisposeAsync() =>
+        new(Task.FromException(new InvalidOperationException("App Server cleanup failed.")));
+}
+
+file sealed class TestHostCodexExecutablePathProvider : IHostCodexExecutablePathProvider
+{
+    private readonly Func<int, string?> _queryResolve;
+    private readonly Func<int, string?> _mainModuleResolve;
+
+    public TestHostCodexExecutablePathProvider(
+        Func<int, string?> queryResolve,
+        Func<int, string?>? mainModuleResolve = null)
+    {
+        _queryResolve = queryResolve;
+        _mainModuleResolve = mainModuleResolve ?? (_ => null);
+    }
+
+    public int QueryCallCount { get; private set; }
+
+    public int MainModuleCallCount { get; private set; }
+
+    public string? TryGetExecutablePathWithQuery(int processId)
+    {
+        QueryCallCount++;
+        return _queryResolve(processId);
+    }
+
+    public string? TryGetExecutablePathWithMainModule(int processId)
+    {
+        MainModuleCallCount++;
+        return _mainModuleResolve(processId);
+    }
 }
 
 file sealed class TestAppServerSession : IHelperAppServerSession

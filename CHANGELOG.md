@@ -2,6 +2,16 @@
 
 All notable changes to CodexQuotaTitle are documented in this file.
 
+## Unreleased
+
+## [0.1.8] - 2026-08-29
+
+- Prefer Codex App Server as the live quota source, with session rollout files as an automatic fallback.
+- Prevent stale rollout snapshots from overriding fresher App Server quotas during notifications and periodic resynchronization.
+- Expose App Server connection, executable-resolution, and fallback diagnostics through MCP status.
+- Harden Codex Desktop executable resolution with `QueryFullProcessImageNameW`, while retaining compatibility fallbacks without requiring a separate CLI.
+- Improve generated `settings.json` documentation for `dateFormat`, reset-date placeholders, and .NET date/time format examples.
+
 ## [0.1.7] - 2026-08-24
 
 - Fall back to the newest profile-scoped rollout quota snapshot when SessionStart does not provide an active session.

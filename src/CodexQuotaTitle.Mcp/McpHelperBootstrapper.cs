@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using CodexQuotaTitle.Profiles;
 using CodexQuotaTitle.Sessions;
@@ -39,17 +40,17 @@ public sealed record McpHelperStatus(
 {
     public string? QuotaSelection { get; init; }
 
-    public bool AppServerConnected => false;
+    public bool AppServerConnected { get; init; }
 
-    public string AppServerStatus => "not-started";
+    public string AppServerStatus { get; init; } = "not-started";
 
-    public string? AppServerLastError => null;
+    public string? AppServerLastError { get; init; }
 
-    public string? AppServerLastExceptionType => null;
+    public string? AppServerLastExceptionType { get; init; }
 
-    public string AppServerExecutableSource => "not-started";
+    public string AppServerExecutableSource { get; init; } = "not-started";
 
-    public bool? AppServerExecutableAvailable => null;
+    public bool? AppServerExecutableAvailable { get; init; }
 }
 
 public interface IHelperProcessStarter
@@ -159,6 +160,7 @@ public sealed class McpHelperBootstrapper
                 Windows: Array.Empty<HelperWindowCandidate>())
             {
                 QuotaSelection = RolloutQuotaSelections.ProfileFallback,
+                AppServerConnected = false,
             };
         }
 
@@ -187,6 +189,12 @@ public sealed class McpHelperBootstrapper
             state?.Windows ?? Array.Empty<HelperWindowCandidate>())
         {
             QuotaSelection = state?.QuotaSelection ?? RolloutQuotaSelections.ProfileFallback,
+            AppServerConnected = state?.AppServerConnected ?? false,
+            AppServerStatus = state?.AppServerStatus ?? "not-started",
+            AppServerLastError = state?.AppServerLastError,
+            AppServerLastExceptionType = state?.AppServerLastExceptionType,
+            AppServerExecutableSource = state?.AppServerExecutableSource ?? "not-started",
+            AppServerExecutableAvailable = state?.AppServerExecutableAvailable,
         };
     }
 
@@ -250,7 +258,7 @@ public sealed class SelfMcpHelperProcessStarter : IHelperProcessStarter
 
         if (string.Equals(Path.GetFileNameWithoutExtension(processPath), "dotnet", StringComparison.OrdinalIgnoreCase))
         {
-            var entryAssemblyPath = Assembly.GetEntryAssembly()?.Location;
+            var entryAssemblyPath = GetEntryAssemblyPathForDotnetHost();
             if (string.IsNullOrWhiteSpace(entryAssemblyPath))
             {
                 throw new InvalidOperationException("Unable to resolve the MCP entry assembly.");
@@ -286,6 +294,13 @@ public sealed class SelfMcpHelperProcessStarter : IHelperProcessStarter
         _ = DisposeAfterExitAsync(process);
         return process.Id;
     }
+
+    [UnconditionalSuppressMessage(
+        "SingleFile",
+        "IL3000:Avoid accessing Assembly file path when publishing as a single file",
+        Justification = "This path is used only when Environment.ProcessPath identifies the dotnet host; single-file builds execute the native app path branch.")]
+    private static string? GetEntryAssemblyPathForDotnetHost() =>
+        Assembly.GetEntryAssembly()?.Location;
 
     private static async Task DisposeAfterExitAsync(Process process)
     {

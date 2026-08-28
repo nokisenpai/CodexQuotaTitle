@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 
 namespace CodexQuotaTitle.Integration;
 
@@ -52,7 +53,7 @@ public sealed class HookLauncher
 
         if (string.Equals(Path.GetFileNameWithoutExtension(processPath), "dotnet", StringComparison.OrdinalIgnoreCase))
         {
-            var entryAssemblyPath = Assembly.GetEntryAssembly()?.Location;
+            var entryAssemblyPath = GetEntryAssemblyPathForDotnetHost();
             if (string.IsNullOrWhiteSpace(entryAssemblyPath))
             {
                 throw new InvalidOperationException("Unable to resolve the entry assembly for the probe helper.");
@@ -75,4 +76,11 @@ public sealed class HookLauncher
         cancellationToken.ThrowIfCancellationRequested();
         return helper;
     }
+
+    [UnconditionalSuppressMessage(
+        "SingleFile",
+        "IL3000:Avoid accessing Assembly file path when publishing as a single file",
+        Justification = "This path is used only when Environment.ProcessPath identifies the dotnet host; single-file builds execute the native app path branch.")]
+    private static string? GetEntryAssemblyPathForDotnetHost() =>
+        Assembly.GetEntryAssembly()?.Location;
 }
