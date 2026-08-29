@@ -86,6 +86,8 @@ var tests = new (string Name, Action Execute)[]
     ("MCP status retains App Server diagnostics", McpHelperStatusRetainsAppServerDiagnostics),
     ("Helper refreshes after an App Server quota notification", () => McpHelperRefreshesAfterQuotaNotification().GetAwaiter().GetResult()),
     ("Helper periodically resynchronizes App Server quotas", () => McpHelperPerformsPeriodicQuotaFallback().GetAwaiter().GetResult()),
+    ("Helper periodic App Server resync survives continuous rollout changes", () => McpHelperPeriodicResyncSurvivesContinuousRolloutChanges().GetAwaiter().GetResult()),
+    ("Helper shutdown stops periodic App Server resync", () => McpHelperShutdownStopsPeriodicResync().GetAwaiter().GetResult()),
     ("MCP status retains rollout runtime diagnostics", McpHelperStatusRetainsRolloutDiagnostics),
     ("Helper cleanup restores the base after a fully custom title", () => McpHelperCleanupRestoresBaseAfterFullyCustomTitle().GetAwaiter().GetResult()),
     ("MCP stdio server completes the bootstrap handshake and status call", () => McpStdioServerCompletesBootstrapHandshake().GetAwaiter().GetResult()),
@@ -1803,6 +1805,138 @@ static async Task McpHelperPerformsPeriodicQuotaFallback()
         DeleteRuntimeDirectory(runtimePaths);
     }
 }
+
+static async Task McpHelperPeriodicResyncSurvivesContinuousRolloutChanges()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-rollout-starvation-tests", Guid.NewGuid().ToString("N")));
+    var runtimePaths = new HelperRuntimePaths(Path.Combine(Path.GetTempPath(), "cqt-rollout-starvation-tests", Guid.NewGuid().ToString("N")));
+    var refreshInterval = TimeSpan.FromMilliseconds(60);
+    try
+    {
+        var rolloutSource = new ContinuouslyChangingTestRolloutQuotaSource(
+            new RolloutQuotaReadResult(
+                RolloutQuotaSourceStatuses.WatchingSession,
+                "session-continuously-changing",
+                true,
+                new QuotaReadResult(
+                    new QuotaSnapshot(
+                        "codex",
+                        "Codex",
+                        null,
+                        new RateLimitWindow(82m, 10080, DateTimeOffset.UtcNow.AddDays(4))),
+                    new Dictionary<string, QuotaSnapshot>()),
+                DateTimeOffset.UtcNow,
+                QuotaSelection: RolloutQuotaSelections.ActiveSession),
+            TimeSpan.FromMilliseconds(5));
+        var factory = new TestAppServerSessionFactory(readDelay: TimeSpan.FromMilliseconds(100));
+        var hostLifetime = new NeverExitingTestHostProcessLifetime();
+        using var helperCancellation = new CancellationTokenSource();
+        var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(
+            new LocalAppDataSettingsPathResolver(Path.Combine(runtimePaths.DirectoryPath, "settings")));
+        var service = new McpHelperService(
+            hostLifetime,
+            new TestHostWindowProvider(),
+            settingsFactory,
+            new TestSettingsChangeWatcherFactory(),
+            new TestAutomaticTitleUpdateService(),
+            refreshInterval: refreshInterval,
+            rolloutQuotaSourceFactory: new TestRolloutQuotaSourceFactory(rolloutSource),
+            appServerSessionFactory: factory);
+        var run = service.RunAsync(
+            new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths),
+            helperCancellation.Token);
+        await factory.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await WaitUntilAsync(
+            () => rolloutSource.ObservedChangeCount >= 1,
+            TimeSpan.FromSeconds(5));
+        await Task.Delay(TimeSpan.FromSeconds(2));
+
+        var rolloutChangeCount = rolloutSource.ChangeCount;
+        var appServerReadCount = factory.Session.ReadRateLimitsCallCount;
+        var maxConcurrentReads = factory.Session.MaxConcurrentReadRateLimits;
+        var runCompletedBeforeShutdown = run.IsCompleted;
+        helperCancellation.Cancel();
+        var runResult = await run.WaitAsync(TimeSpan.FromSeconds(5));
+        var state = runResult.FinalState;
+        var terminationLog = File.ReadLines(Path.Combine(runtimePaths.DirectoryPath, "helper-service.log"))
+            .LastOrDefault(line =>
+                line.Contains("HELPER_SERVICE_STOPPED", StringComparison.Ordinal) ||
+                line.Contains("_FAILED", StringComparison.Ordinal))
+            ?? "<none>";
+
+        AssertTrue(
+            rolloutChangeCount >= 5,
+            "The test did not sustain rollout activity beyond one App Server refresh interval.");
+        AssertTrue(
+            !runCompletedBeforeShutdown,
+            $"The helper stopped during continuous rollout activity. TerminationLog={terminationLog}.");
+        AssertTrue(
+            appServerReadCount >= 2,
+            "Continuous rollout changes starved the periodic App Server refresh. " +
+            $"Reads={appServerReadCount}, GeneratedChanges={rolloutChangeCount}, " +
+            $"ObservedChanges={rolloutSource.ObservedChangeCount}, RunCompleted={runCompletedBeforeShutdown}, " +
+            $"AcquiredSingleton={runResult.AcquiredProfileSingleton}, " +
+            $"FinalAppServerStatus={runResult.FinalState?.AppServerStatus}, " +
+            $"FinalError={runResult.FinalState?.LastError ?? "<none>"}, " +
+            $"TerminationLog={terminationLog}.");
+        AssertTrue(
+            maxConcurrentReads == 1,
+            "Periodic App Server refreshes overlapped.");
+        AssertTrue(state is not null, "The helper did not persist runtime state.");
+        AssertEqual("app-server", state!.QuotaSource);
+        AssertTrue(
+            state.Quotas.Single().Secondary?.UsedPercent == 12m,
+            "Rollout activity overwrote fresher App Server quotas.");
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static async Task McpHelperShutdownStopsPeriodicResync()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-periodic-shutdown-tests", Guid.NewGuid().ToString("N")));
+    var runtimePaths = new HelperRuntimePaths(Path.Combine(Path.GetTempPath(), "cqt-periodic-shutdown-tests", Guid.NewGuid().ToString("N")));
+    var refreshInterval = TimeSpan.FromMilliseconds(30);
+    try
+    {
+        var factory = new TestAppServerSessionFactory();
+        var hostLifetime = new TestHostProcessLifetime();
+        var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(
+            new LocalAppDataSettingsPathResolver(Path.Combine(runtimePaths.DirectoryPath, "settings")));
+        var service = new McpHelperService(
+            factory,
+            hostLifetime,
+            new TestHostWindowProvider(),
+            settingsFactory,
+            new TestSettingsChangeWatcherFactory(),
+            new TestAutomaticTitleUpdateService(),
+            refreshInterval: refreshInterval);
+        var run = service.RunAsync(
+            new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths));
+        await factory.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => factory.Session.ReadRateLimitsCallCount >= 2, TimeSpan.FromSeconds(2));
+
+        hostLifetime.Complete();
+        var result = await run.WaitAsync(TimeSpan.FromSeconds(5));
+        var readsAfterShutdown = factory.Session.ReadRateLimitsCallCount;
+        await Task.Delay(TimeSpan.FromMilliseconds(refreshInterval.TotalMilliseconds * 3));
+
+        AssertTrue(
+            factory.Session.ReadRateLimitsCallCount == readsAfterShutdown,
+            "The periodic App Server schedule continued after helper shutdown.");
+        AssertTrue(
+            factory.Session.DisposeCallCount == 1,
+            "The App Server session was not disposed exactly once.");
+        AssertTrue(result.FinalState is { IsRunning: false }, "The helper did not finish cleanly after host shutdown.");
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
 #pragma warning restore CS8321
 
 static McpProcessTree CreateDesktopProcessTree() =>
@@ -2546,6 +2680,13 @@ file sealed class TestHostProcessLifetime : IHostProcessLifetime
     public void Complete() => _exit.TrySetResult();
 }
 
+file sealed class NeverExitingTestHostProcessLifetime : IHostProcessLifetime
+{
+    public Task WaitForExitAsync(int processId, CancellationToken cancellationToken) =>
+        Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+}
+
+
 file sealed class TestRolloutQuotaSourceFactory : IRolloutQuotaSourceFactory
 {
     private readonly IRolloutQuotaSource _source;
@@ -2573,6 +2714,76 @@ file sealed class TestRolloutQuotaSource : IRolloutQuotaSource
 
     public void Dispose()
     {
+    }
+}
+
+file sealed class ContinuouslyChangingTestRolloutQuotaSource : IRolloutQuotaSource
+{
+    private readonly CancellationTokenSource _disposeCancellation = new();
+    private readonly SemaphoreSlim _changeSignal = new(0, 1);
+    private readonly RolloutQuotaReadResult _result;
+    private readonly TimeSpan _changeInterval;
+    private readonly Task _publisherTask;
+    private int _changeCount;
+    private int _observedChangeCount;
+
+    public ContinuouslyChangingTestRolloutQuotaSource(
+        RolloutQuotaReadResult result,
+        TimeSpan changeInterval)
+    {
+        _result = result;
+        _changeInterval = changeInterval;
+        _publisherTask = PublishChangesAsync();
+    }
+
+    public int ChangeCount => Volatile.Read(ref _changeCount);
+
+    public int ObservedChangeCount => Volatile.Read(ref _observedChangeCount);
+
+    public RolloutQuotaReadResult Refresh() => _result;
+
+    public async Task WaitForChangeAsync(CancellationToken cancellationToken)
+    {
+        await _changeSignal.WaitAsync(cancellationToken);
+        Interlocked.Increment(ref _observedChangeCount);
+    }
+
+    public void Dispose()
+    {
+        _disposeCancellation.Cancel();
+        try
+        {
+            _publisherTask.GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException) when (_disposeCancellation.IsCancellationRequested)
+        {
+        }
+
+        _changeSignal.Dispose();
+        _disposeCancellation.Dispose();
+    }
+
+    private async Task PublishChangesAsync()
+    {
+        using var timer = new PeriodicTimer(_changeInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(_disposeCancellation.Token))
+            {
+                Interlocked.Increment(ref _changeCount);
+                try
+                {
+                    _changeSignal.Release();
+                }
+                catch (SemaphoreFullException)
+                {
+                    // File watcher changes are coalesced while one signal is pending.
+                }
+            }
+        }
+        catch (OperationCanceledException) when (_disposeCancellation.IsCancellationRequested)
+        {
+        }
     }
 }
 
@@ -2638,13 +2849,18 @@ file sealed class RolloutFixture : IDisposable
 
 file sealed class TestAppServerSessionFactory : IHelperAppServerSessionFactory
 {
+    public TestAppServerSessionFactory(TimeSpan? readDelay = null)
+    {
+        Session = new TestAppServerSession(readDelay ?? TimeSpan.Zero);
+    }
+
     public List<string> CodexHomes { get; } = [];
 
     public List<string> Executables { get; } = [];
 
     public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    public TestAppServerSession Session { get; } = new();
+    public TestAppServerSession Session { get; }
 
     public Task<IHelperAppServerSession> StartAsync(CodexAppServerLaunchRequest request, CancellationToken cancellationToken)
     {
@@ -2767,28 +2983,76 @@ file sealed class TestHostCodexExecutablePathProvider : IHostCodexExecutablePath
 
 file sealed class TestAppServerSession : IHelperAppServerSession
 {
+    private readonly TimeSpan _readDelay;
+    private int _activeReadRateLimits;
+    private int _disposeCallCount;
+    private int _maxConcurrentReadRateLimits;
+    private int _readRateLimitsCallCount;
+
+    public TestAppServerSession(TimeSpan? readDelay = null)
+    {
+        _readDelay = readDelay ?? TimeSpan.Zero;
+    }
+
     public event EventHandler<QuotaSnapshot>? RateLimitsUpdated;
 
-    public int ReadRateLimitsCallCount { get; private set; }
+    public int DisposeCallCount => Volatile.Read(ref _disposeCallCount);
+
+    public int MaxConcurrentReadRateLimits => Volatile.Read(ref _maxConcurrentReadRateLimits);
+
+    public int ReadRateLimitsCallCount => Volatile.Read(ref _readRateLimitsCallCount);
 
     public Task<CodexAccountSummary> ReadAccountAsync(CancellationToken cancellationToken) =>
         Task.FromResult(new CodexAccountSummary("chatgpt", "not-for-diagnostics@example.test", "pro", false));
 
-    public Task<QuotaReadResult> ReadRateLimitsAsync(CancellationToken cancellationToken)
+    public async Task<QuotaReadResult> ReadRateLimitsAsync(CancellationToken cancellationToken)
     {
-        ReadRateLimitsCallCount++;
-        return Task.FromResult(new QuotaReadResult(
-            new QuotaSnapshot(
-                "codex",
-                "Codex",
-                new RateLimitWindow(37m, 300, DateTimeOffset.UtcNow.AddHours(2)),
-                new RateLimitWindow(12m, 10080, DateTimeOffset.UtcNow.AddDays(4))),
-            new Dictionary<string, QuotaSnapshot>()));
+        Interlocked.Increment(ref _readRateLimitsCallCount);
+        var activeReads = Interlocked.Increment(ref _activeReadRateLimits);
+        UpdateMaxConcurrentReads(activeReads);
+        try
+        {
+            if (_readDelay > TimeSpan.Zero)
+            {
+                await Task.Delay(_readDelay, cancellationToken);
+            }
+
+            return new QuotaReadResult(
+                new QuotaSnapshot(
+                    "codex",
+                    "Codex",
+                    new RateLimitWindow(37m, 300, DateTimeOffset.UtcNow.AddHours(2)),
+                    new RateLimitWindow(12m, 10080, DateTimeOffset.UtcNow.AddDays(4))),
+                new Dictionary<string, QuotaSnapshot>());
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activeReadRateLimits);
+        }
     }
 
     public void PublishQuota(QuotaSnapshot snapshot) => RateLimitsUpdated?.Invoke(this, snapshot);
 
-    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    public ValueTask DisposeAsync()
+    {
+        Interlocked.Increment(ref _disposeCallCount);
+        return ValueTask.CompletedTask;
+    }
+
+    private void UpdateMaxConcurrentReads(int activeReads)
+    {
+        var observed = Volatile.Read(ref _maxConcurrentReadRateLimits);
+        while (activeReads > observed)
+        {
+            var previous = Interlocked.CompareExchange(ref _maxConcurrentReadRateLimits, activeReads, observed);
+            if (previous == observed)
+            {
+                return;
+            }
+
+            observed = previous;
+        }
+    }
 }
 
 file sealed class TestAutomaticTitleUpdateService : IAutomaticTitleUpdateService

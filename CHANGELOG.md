@@ -4,6 +4,12 @@ All notable changes to CodexQuotaTitle are documented in this file.
 
 ## Unreleased
 
+## [0.1.9] - 2026-08-30
+
+- Fix periodic App Server quota resynchronization being postponed indefinitely by frequent rollout changes.
+- Run App Server resynchronization independently from rollout and settings watchers.
+- Prevent overlapping App Server refreshes by rearming the periodic schedule only after the current refresh completes.
+
 ## [0.1.8] - 2026-08-29
 
 - Prefer Codex App Server as the live quota source, with session rollout files as an automatic fallback.

@@ -23,7 +23,7 @@ public sealed record McpHelperServiceRunResult(bool AcquiredProfileSingleton, He
 
 public sealed class McpHelperService
 {
-    public const string HelperVersion = "0.1.8";
+    public const string HelperVersion = "0.1.9";
     private readonly HelperAppServerConnector _appServerConnector;
     private readonly IHostProcessLifetime _hostProcessLifetime;
     private readonly IHostWindowProvider _hostWindowProvider;
@@ -115,6 +115,7 @@ public sealed class McpHelperService
 
         IHelperAppServerSession? appServerSession = null;
         using var quotaNotificationSignal = new SemaphoreSlim(0, 1);
+        using var periodicRefreshCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var quotaNotificationGate = new object();
         QuotaSnapshot? latestQuotaNotification = null;
         EventHandler<QuotaSnapshot>? quotaNotificationHandler = null;
@@ -165,10 +166,10 @@ public sealed class McpHelperService
                 state = RefreshTitle(state, request, settingsStore, stateStore, log, "startup-app-server");
             }
 
+            var periodicTask = Task.Delay(_refreshInterval, periodicRefreshCancellation.Token);
             while (!cancellationToken.IsCancellationRequested)
             {
                 using var waitCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                var periodicTask = Task.Delay(_refreshInterval, waitCancellation.Token);
                 var settingsTask = settingsWatcher.WaitForChangeAsync(waitCancellation.Token);
                 var rolloutTask = quotaSource.WaitForChangeAsync(waitCancellation.Token);
                 var notificationTask = quotaNotificationSignal.WaitAsync(waitCancellation.Token);
@@ -255,6 +256,7 @@ public sealed class McpHelperService
                     "periodic-resync",
                     allowReplacement: appServerSession is null);
                 state = RefreshTitle(state, request, settingsStore, stateStore, log, "periodic");
+                periodicTask = Task.Delay(_refreshInterval, periodicRefreshCancellation.Token);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -274,6 +276,7 @@ public sealed class McpHelperService
         }
         finally
         {
+            periodicRefreshCancellation.Cancel();
             hostLifetimeCancellation.Cancel();
             state = CleanupTitle(state, request, settingsStore, stateStore, log);
             if (appServerSession is not null)
