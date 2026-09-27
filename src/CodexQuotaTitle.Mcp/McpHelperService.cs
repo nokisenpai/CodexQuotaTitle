@@ -23,7 +23,7 @@ public sealed record McpHelperServiceRunResult(bool AcquiredProfileSingleton, He
 
 public sealed class McpHelperService
 {
-    public const string HelperVersion = "0.1.9";
+    public const string HelperVersion = "0.1.10";
     private readonly HelperAppServerConnector _appServerConnector;
     private readonly IHostProcessLifetime _hostProcessLifetime;
     private readonly IHostWindowProvider _hostWindowProvider;

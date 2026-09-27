@@ -75,6 +75,7 @@ var tests = new (string Name, Action Execute)[]
     ("MCP starts one helper per profile and forwards host hints", McpBootstrapperStartsOneHelperPerProfile),
     ("Concurrent MCP bootstraps start one helper for one profile", () => McpBootstrapperSerializesConcurrentStarts().GetAwaiter().GetResult()),
     ("MCP replaces a stale dead helper runtime state", McpBootstrapperReplacesStaleState),
+    ("MCP replaces a stale inaccessible helper runtime state", McpBootstrapperReplacesInaccessibleStaleState),
     ("MCP can start distinct helpers for distinct profiles", () => McpBootstrapperAllowsDistinctProfiles().GetAwaiter().GetResult()),
     ("App Server executable resolution uses QueryFullProcessImageName before MainModule", AppServerExecutableResolutionUsesQueryBeforeMainModule),
     ("App Server executable resolution falls back safely", AppServerExecutableResolutionFallsBackSafely),
@@ -1147,6 +1148,58 @@ static void McpBootstrapperReplacesStaleState()
         AssertTrue(result.StartedNewHelper, "A stale helper state prevented a replacement helper from starting.");
         AssertTrue(result.HelperPid != staleHelperPid, "The stale helper PID was reused.");
         AssertTrue(stateStore.TryRead()?.HelperPid == result.HelperPid, "The stale state was not replaced with the new provisional helper PID.");
+    }
+    finally
+    {
+        DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static void McpBootstrapperReplacesInaccessibleStaleState()
+{
+    var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-mcp-bootstrap-tests", Guid.NewGuid().ToString("N")));
+    var runtimePaths = HelperRuntimePaths.ForProfile(profile.ProfileHash);
+    try
+    {
+        const int staleHelperPid = 6_999;
+        var stateStore = new HelperRuntimeStateStore(runtimePaths);
+        stateStore.Write(new HelperRuntimeState(
+            profile.ProfileHash,
+            "mcp",
+            staleHelperPid,
+            333,
+            222,
+            true,
+            false,
+            null,
+            Array.Empty<HelperQuotaSnapshot>(),
+            0,
+            "WINDOW_CORRELATION_AMBIGUOUS",
+            Array.Empty<HelperWindowCandidate>(),
+            DateTimeOffset.UtcNow));
+        var liveness = new TestProcessLiveness();
+        liveness.DenyAccess(staleHelperPid);
+        var starter = new TestHelperProcessStarter(liveness);
+        var bootstrapLog = new McpBootstrapLog(runtimePaths.DirectoryPath);
+        var bootstrapper = new McpHelperBootstrapper(
+            bootstrapLog,
+            new McpStartupContext(profile.RawCodexHome, profile),
+            CreateDesktopProcessTree(),
+            starter,
+            liveness);
+
+        var staleStatus = bootstrapper.GetStatus();
+        var result = bootstrapper.EnsureHelper();
+        var runningStatus = bootstrapper.GetStatus();
+
+        AssertTrue(!staleStatus.HelperRunning, "An inaccessible reused PID was reported as the running helper.");
+        AssertTrue(result.StartedNewHelper, "An inaccessible reused PID prevented the replacement helper from starting.");
+        AssertTrue(result.HelperPid != staleHelperPid, "The inaccessible stale helper PID was reused.");
+        AssertTrue(runningStatus.HelperRunning, "The replacement helper was not reported as running.");
+        AssertTrue(runningStatus.HelperPid == result.HelperPid, "MCP status did not expose the replacement helper PID.");
+        AssertContains(
+            File.ReadAllText(Path.Combine(runtimePaths.DirectoryPath, "mcp-bootstrap.log")),
+            $"MCP_HELPER_LIVENESS_UNAVAILABLE PID={staleHelperPid} NATIVE_ERROR_CODE=5");
     }
     finally
     {
@@ -2568,12 +2621,18 @@ file sealed class McpProcessFixture : IDisposable
 file sealed class TestProcessLiveness : IProcessLiveness
 {
     private readonly HashSet<int> _runningProcessIds = [];
+    private readonly HashSet<int> _inaccessibleProcessIds = [];
     private readonly object _sync = new();
 
     public bool IsRunning(int processId)
     {
         lock (_sync)
         {
+            if (_inaccessibleProcessIds.Contains(processId))
+            {
+                throw new System.ComponentModel.Win32Exception(5);
+            }
+
             return _runningProcessIds.Contains(processId);
         }
     }
@@ -2583,6 +2642,14 @@ file sealed class TestProcessLiveness : IProcessLiveness
         lock (_sync)
         {
             _runningProcessIds.Add(processId);
+        }
+    }
+
+    public void DenyAccess(int processId)
+    {
+        lock (_sync)
+        {
+            _inaccessibleProcessIds.Add(processId);
         }
     }
 }

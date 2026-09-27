@@ -4,6 +4,11 @@ All notable changes to CodexQuotaTitle are documented in this file.
 
 ## Unreleased
 
+## [0.1.10] - 2026-09-28
+
+- Recover automatically when a stale helper PID has been reused by an inaccessible Windows process.
+- Keep MCP status and helper bootstrap alive when process-liveness checks return Access Denied.
+
 ## [0.1.9] - 2026-08-30
 
 - Fix periodic App Server quota resynchronization being postponed indefinitely by frequent rollout changes.

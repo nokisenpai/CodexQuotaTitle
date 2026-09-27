@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
@@ -120,7 +121,7 @@ public sealed class McpHelperBootstrapper
         if (existingState is not null &&
             string.Equals(existingState.ProfileIdentity, profile.ProfileHash, StringComparison.Ordinal) &&
             existingState.IsRunning &&
-            _processLiveness.IsRunning(existingState.HelperPid))
+            IsHelperRunning(existingState.HelperPid))
         {
             _bootstrapLog.TryAppend($"MCP_HELPER_ALREADY_RUNNING PID={existingState.HelperPid}");
             return new McpHelperBootstrapResult(false, existingState.HelperPid, "already-running");
@@ -165,7 +166,7 @@ public sealed class McpHelperBootstrapper
         }
 
         var state = new HelperRuntimeStateStore(HelperRuntimePaths.ForProfile(profile.ProfileHash)).TryRead();
-        var helperRunning = state is not null && state.IsRunning && _processLiveness.IsRunning(state.HelperPid);
+        var helperRunning = state is not null && state.IsRunning && IsHelperRunning(state.HelperPid);
         return new McpHelperStatus(
             profile.ProfileHash,
             helperRunning,
@@ -199,6 +200,20 @@ public sealed class McpHelperBootstrapper
     }
 
     public ProfileIdentity? GetProfileIdentity() => _startupContext.ProfileIdentity;
+
+    private bool IsHelperRunning(int processId)
+    {
+        try
+        {
+            return _processLiveness.IsRunning(processId);
+        }
+        catch (Win32Exception exception)
+        {
+            _bootstrapLog.TryAppend(
+                $"MCP_HELPER_LIVENESS_UNAVAILABLE PID={processId} NATIVE_ERROR_CODE={exception.NativeErrorCode}");
+            return false;
+        }
+    }
 
     private static HelperRuntimeState CreateProvisionalState(McpHelperStartupRequest request, int helperPid) =>
         new(
