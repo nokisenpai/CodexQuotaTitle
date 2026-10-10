@@ -4,6 +4,12 @@ All notable changes to CodexQuotaTitle are documented in this file.
 
 ## Unreleased
 
+## [0.1.11] - 2026-10-10
+
+- Start rollout readers and watchers only when App Server is unavailable, avoiding session-history scans while live quotas work.
+- Cache profile fallback snapshots per file and read appended bytes with a bounded rewrite check, instead of repeatedly rereading all session logs.
+- Reuse the selected cached snapshot and invalidate cached files after replacement, truncation, or deletion.
+
 ## [0.1.10] - 2026-09-28
 
 - Recover automatically when a stale helper PID has been reused by an inaccessible Windows process.

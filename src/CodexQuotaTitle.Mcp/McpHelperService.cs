@@ -23,7 +23,7 @@ public sealed record McpHelperServiceRunResult(bool AcquiredProfileSingleton, He
 
 public sealed class McpHelperService
 {
-    public const string HelperVersion = "0.1.10";
+    public const string HelperVersion = "0.1.11";
     private readonly HelperAppServerConnector _appServerConnector;
     private readonly IHostProcessLifetime _hostProcessLifetime;
     private readonly IHostWindowProvider _hostWindowProvider;
@@ -114,6 +114,7 @@ public sealed class McpHelperService
         }
 
         IHelperAppServerSession? appServerSession = null;
+        IRolloutQuotaSource? quotaSource = null;
         using var quotaNotificationSignal = new SemaphoreSlim(0, 1);
         using var periodicRefreshCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var quotaNotificationGate = new object();
@@ -121,10 +122,7 @@ public sealed class McpHelperService
         EventHandler<QuotaSnapshot>? quotaNotificationHandler = null;
         try
         {
-            using var quotaSource = _rolloutQuotaSourceFactory.Create(request.Profile);
             using var settingsWatcher = _settingsChangeWatcherFactory.Create(settingsStore.Paths);
-            state = RefreshRolloutQuotas(state, quotaSource, stateStore, log, "startup", allowReplacement: true);
-            state = RefreshTitle(state, request, settingsStore, stateStore, log, "startup-rollout");
 
             var appServerStart = await TryStartAppServerAsync(
                 request,
@@ -166,12 +164,20 @@ public sealed class McpHelperService
                 state = RefreshTitle(state, request, settingsStore, stateStore, log, "startup-app-server");
             }
 
+            if (appServerSession is null && !appServerStart.HostExited)
+            {
+                quotaSource = _rolloutQuotaSourceFactory.Create(request.Profile);
+                state = RefreshRolloutQuotas(state, quotaSource, stateStore, log, "startup", allowReplacement: true);
+                state = RefreshTitle(state, request, settingsStore, stateStore, log, "startup-rollout");
+            }
+
             var periodicTask = Task.Delay(_refreshInterval, periodicRefreshCancellation.Token);
             while (!cancellationToken.IsCancellationRequested)
             {
                 using var waitCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 var settingsTask = settingsWatcher.WaitForChangeAsync(waitCancellation.Token);
-                var rolloutTask = quotaSource.WaitForChangeAsync(waitCancellation.Token);
+                var rolloutTask = quotaSource?.WaitForChangeAsync(waitCancellation.Token)
+                    ?? Task.Delay(Timeout.InfiniteTimeSpan, waitCancellation.Token);
                 var notificationTask = quotaNotificationSignal.WaitAsync(waitCancellation.Token);
                 var completed = await Task.WhenAny(hostExitTask, periodicTask, settingsTask, rolloutTask, notificationTask);
                 waitCancellation.Cancel();
@@ -195,7 +201,7 @@ public sealed class McpHelperService
                     await rolloutTask;
                     state = RefreshRolloutQuotas(
                         state,
-                        quotaSource,
+                        quotaSource!,
                         stateStore,
                         log,
                         "watcher",
@@ -248,13 +254,17 @@ public sealed class McpHelperService
                     }
                 }
 
-                state = RefreshRolloutQuotas(
-                    state,
-                    quotaSource,
-                    stateStore,
-                    log,
-                    "periodic-resync",
-                    allowReplacement: appServerSession is null);
+                if (appServerSession is null)
+                {
+                    quotaSource ??= _rolloutQuotaSourceFactory.Create(request.Profile);
+                    state = RefreshRolloutQuotas(
+                        state,
+                        quotaSource,
+                        stateStore,
+                        log,
+                        "periodic-resync",
+                        allowReplacement: true);
+                }
                 state = RefreshTitle(state, request, settingsStore, stateStore, log, "periodic");
                 periodicTask = Task.Delay(_refreshInterval, periodicRefreshCancellation.Token);
             }
@@ -278,6 +288,7 @@ public sealed class McpHelperService
         {
             periodicRefreshCancellation.Cancel();
             hostLifetimeCancellation.Cancel();
+            quotaSource?.Dispose();
             state = CleanupTitle(state, request, settingsStore, stateStore, log);
             if (appServerSession is not null)
             {

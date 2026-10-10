@@ -3,4 +3,7 @@
     <AssemblyName>CodexQuotaTitle.Core</AssemblyName>
     <RootNamespace>CodexQuotaTitle</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="CodexQuotaTitle.Tests" />
+  </ItemGroup>
 </Project>

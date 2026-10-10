@@ -54,6 +54,7 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
     private const int BufferSize = 16 * 1024;
     private readonly string _sessionsDirectory;
     private readonly ActiveSessionStore _activeSessionStore;
+    private readonly ProfileRolloutQuotaIndex _profileIndex;
     private readonly SemaphoreSlim _changes = new(0, 1);
     private readonly FileSystemWatcher _activeSessionWatcher;
     private FileSystemWatcher? _sessionsWatcher;
@@ -78,6 +79,7 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
         ArgumentNullException.ThrowIfNull(activeSessionStore);
         _sessionsDirectory = Path.Combine(codexHome, "sessions");
         _activeSessionStore = activeSessionStore;
+        _profileIndex = new ProfileRolloutQuotaIndex(_sessionsDirectory);
 
         Directory.CreateDirectory(activeSessionStore.DirectoryPath);
         _activeSessionWatcher = CreateWatcher(
@@ -86,6 +88,8 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
             includeSubdirectories: false);
         EnsureSessionsWatcher();
     }
+
+    internal long ProfileBytesRead => _profileIndex.BytesRead;
 
     public RolloutQuotaReadResult Refresh()
     {
@@ -117,10 +121,14 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
                 QuotaSelection: RolloutQuotaSelections.ProfileFallback);
         }
 
-        return RefreshSelectedRollout(profileRollout.Path, null, RolloutQuotaSelections.ProfileFallback);
+        return RefreshSelectedRollout(profileRollout.Path, null, RolloutQuotaSelections.ProfileFallback, profileRollout);
     }
 
-    private RolloutQuotaReadResult RefreshSelectedRollout(string resolvedPath, string? activeSessionId, string quotaSelection)
+    private RolloutQuotaReadResult RefreshSelectedRollout(
+        string resolvedPath,
+        string? activeSessionId,
+        string quotaSelection,
+        ProfileRolloutSnapshot? profileSnapshot = null)
     {
         try
         {
@@ -131,7 +139,15 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
                 SwitchRollout(resolvedPath, activeSessionId, quotaSelection);
             }
 
-            ReadAvailableBytes();
+            if (profileSnapshot is not null)
+            {
+                _quotas = profileSnapshot.Quotas;
+                _lastQuotaUpdatedAtUtc = profileSnapshot.ObservedAtUtc;
+            }
+            else
+            {
+                ReadAvailableBytes();
+            }
             var watchingStatus = string.Equals(quotaSelection, RolloutQuotaSelections.ActiveSession, StringComparison.Ordinal)
                 ? RolloutQuotaSourceStatuses.WatchingSession
                 : RolloutQuotaSourceStatuses.WatchingProfile;
@@ -240,93 +256,7 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
         return null;
     }
 
-    private ProfileRolloutCandidate? ResolveLatestProfileRollout()
-    {
-        if (!Directory.Exists(_sessionsDirectory))
-        {
-            return null;
-        }
-
-        try
-        {
-            var candidates = Directory
-                .EnumerateFiles(_sessionsDirectory, "*.jsonl", SearchOption.AllDirectories)
-                .Select(path => new FileInfo(path))
-                .OrderByDescending(file => file.LastWriteTimeUtc)
-                .ThenBy(file => file.FullName, StringComparer.OrdinalIgnoreCase);
-
-            ProfileRolloutCandidate? latest = null;
-            foreach (var candidate in candidates)
-            {
-                if (!TryReadLatestRateLimits(candidate, out var snapshot) || snapshot is null)
-                {
-                    continue;
-                }
-
-                if (latest is null || snapshot.IsNewerThan(latest))
-                {
-                    latest = snapshot;
-                }
-            }
-
-            return latest;
-        }
-        catch (IOException)
-        {
-            return null;
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return null;
-        }
-    }
-
-    private static bool TryReadLatestRateLimits(FileInfo file, out ProfileRolloutCandidate? latest)
-    {
-        latest = null;
-        try
-        {
-            var lastWriteTimeUtc = new DateTimeOffset(file.LastWriteTimeUtc);
-            using var stream = new FileStream(file.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, BufferSize, leaveOpen: false);
-            var lineNumber = 0L;
-            while (reader.ReadLine() is { } line)
-            {
-                lineNumber++;
-                try
-                {
-                    if (!TryReadRateLimits(Encoding.UTF8.GetBytes(line), out var quotas, out var timestamp))
-                    {
-                        continue;
-                    }
-
-                    var snapshot = new ProfileRolloutCandidate(
-                        file.FullName,
-                        timestamp ?? lastWriteTimeUtc,
-                        lastWriteTimeUtc,
-                        lineNumber);
-                    if (latest is null || snapshot.IsNewerThan(latest))
-                    {
-                        latest = snapshot;
-                    }
-                }
-                catch (JsonException)
-                {
-                    // A partially written JSONL line is ignored until the next watcher or resync pass.
-                }
-            }
-
-            return latest is not null;
-        }
-        catch (IOException)
-        {
-            return false;
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return false;
-        }
-    }
+    private ProfileRolloutSnapshot? ResolveLatestProfileRollout() => _profileIndex.Refresh();
 
     private static bool IsValidRollout(string? path, string expectedSessionId)
     {
@@ -514,7 +444,7 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
         return false;
     }
 
-    private static bool TryReadRateLimits(ReadOnlySpan<byte> line, out QuotaReadResult quotas, out DateTimeOffset? timestamp)
+    internal static bool TryReadRateLimits(ReadOnlySpan<byte> line, out QuotaReadResult quotas, out DateTimeOffset? timestamp)
     {
         line = TrimUtf8Bom(line);
         quotas = default!;
@@ -777,32 +707,5 @@ public sealed class RolloutQuotaSource : IRolloutQuotaSource
     private void ThrowIfDisposed()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-    }
-
-    private sealed record ProfileRolloutCandidate(
-        string Path,
-        DateTimeOffset ObservedAtUtc,
-        DateTimeOffset LastWriteTimeUtc,
-        long LineNumber)
-    {
-        public bool IsNewerThan(ProfileRolloutCandidate other)
-        {
-            var observedComparison = ObservedAtUtc.CompareTo(other.ObservedAtUtc);
-            if (observedComparison != 0)
-            {
-                return observedComparison > 0;
-            }
-
-            var writeComparison = LastWriteTimeUtc.CompareTo(other.LastWriteTimeUtc);
-            if (writeComparison != 0)
-            {
-                return writeComparison > 0;
-            }
-
-            var lineComparison = LineNumber.CompareTo(other.LineNumber);
-            return lineComparison != 0
-                ? lineComparison > 0
-                : string.Compare(Path, other.Path, StringComparison.OrdinalIgnoreCase) > 0;
-        }
     }
 }

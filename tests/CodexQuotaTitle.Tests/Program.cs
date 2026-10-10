@@ -58,6 +58,10 @@ var tests = new (string Name, Action Execute)[]
     ("Rollout source reads an incrementally completed JSONL line", RolloutSourceReadsIncrementalJsonl),
     ("Rollout source handles append, resync, rotation, and truncation", () => RolloutSourceHandlesFileChanges().GetAwaiter().GetResult()),
     ("Rollout source switches profile fallback when another rollout changes", () => RolloutSourceSwitchesProfileFallbackOnOtherRolloutChange().GetAwaiter().GetResult()),
+    ("Profile fallback reads unchanged history only once", RolloutPerformanceTests.UnchangedHistoryIsNotReadAgain),
+    ("Profile fallback reads only appended bytes including partial lines", RolloutPerformanceTests.OnlyAppendedBytesAreRead),
+    ("Profile fallback invalidates replaced and deleted files", RolloutPerformanceTests.FileReplacementAndDeletionInvalidateCache),
+    ("Profile fallback preserves timestamp-less snapshot ordering", RolloutPerformanceTests.TimestampFallbackIsPreserved),
     ("Rollout source never exposes conversation content", RolloutSourceDoesNotExposeConversationContent),
     ("Rollout source works without any codex executable", RolloutSourceWorksWithoutCodexExecutable),
     ("Bootstrap log records plugin runtime paths", BootstrapLogRecordsPluginRuntimePaths),
@@ -88,6 +92,7 @@ var tests = new (string Name, Action Execute)[]
     ("Helper refreshes after an App Server quota notification", () => McpHelperRefreshesAfterQuotaNotification().GetAwaiter().GetResult()),
     ("Helper periodically resynchronizes App Server quotas", () => McpHelperPerformsPeriodicQuotaFallback().GetAwaiter().GetResult()),
     ("Helper periodic App Server resync survives continuous rollout changes", () => McpHelperPeriodicResyncSurvivesContinuousRolloutChanges().GetAwaiter().GetResult()),
+    ("Helper activates rollout fallback after an App Server failure", () => McpHelperActivatesFallbackAfterAppServerFailure().GetAwaiter().GetResult()),
     ("Helper shutdown stops periodic App Server resync", () => McpHelperShutdownStopsPeriodicResync().GetAwaiter().GetResult()),
     ("MCP status retains rollout runtime diagnostics", McpHelperStatusRetainsRolloutDiagnostics),
     ("Helper cleanup restores the base after a fully custom title", () => McpHelperCleanupRestoresBaseAfterFullyCustomTitle().GetAwaiter().GetResult()),
@@ -118,7 +123,7 @@ foreach (var test in tests)
     }
     catch (Exception exception)
     {
-        failures.Add($"FAIL {test.Name}: {exception.Message}");
+        failures.Add($"FAIL {test.Name}: {exception}");
     }
 }
 
@@ -1816,7 +1821,7 @@ static async Task McpHelperRefreshesAfterQuotaNotification()
         await factory.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await WaitUntilAsync(
             () => new HelperRuntimeStateStore(runtimePaths).TryRead()?.AppServerConnected == true &&
-                  titleUpdater.Requests.Count >= 2,
+                  titleUpdater.Requests.Count >= 1,
             TimeSpan.FromSeconds(5));
 
         factory.Session.PublishQuota(new QuotaSnapshot("codex", "Codex", new RateLimitWindow(55m, 300, DateTimeOffset.UtcNow.AddHours(1)), null));
@@ -1866,7 +1871,7 @@ static async Task McpHelperPeriodicResyncSurvivesContinuousRolloutChanges()
     var refreshInterval = TimeSpan.FromMilliseconds(60);
     try
     {
-        var rolloutSource = new ContinuouslyChangingTestRolloutQuotaSource(
+        using var rolloutSource = new ContinuouslyChangingTestRolloutQuotaSource(
             new RolloutQuotaReadResult(
                 RolloutQuotaSourceStatuses.WatchingSession,
                 "session-continuously-changing",
@@ -1881,6 +1886,7 @@ static async Task McpHelperPeriodicResyncSurvivesContinuousRolloutChanges()
                 DateTimeOffset.UtcNow,
                 QuotaSelection: RolloutQuotaSelections.ActiveSession),
             TimeSpan.FromMilliseconds(5));
+        var rolloutFactory = new TestRolloutQuotaSourceFactory(rolloutSource);
         var factory = new TestAppServerSessionFactory(readDelay: TimeSpan.FromMilliseconds(100));
         var hostLifetime = new NeverExitingTestHostProcessLifetime();
         using var helperCancellation = new CancellationTokenSource();
@@ -1893,7 +1899,7 @@ static async Task McpHelperPeriodicResyncSurvivesContinuousRolloutChanges()
             new TestSettingsChangeWatcherFactory(),
             new TestAutomaticTitleUpdateService(),
             refreshInterval: refreshInterval,
-            rolloutQuotaSourceFactory: new TestRolloutQuotaSourceFactory(rolloutSource),
+            rolloutQuotaSourceFactory: rolloutFactory,
             appServerSessionFactory: factory);
         var run = service.RunAsync(
             new McpHelperStartupRequest(profile.RawCodexHome!, profile, 333, 222, "mcp", runtimePaths),
@@ -1901,10 +1907,13 @@ static async Task McpHelperPeriodicResyncSurvivesContinuousRolloutChanges()
         await factory.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         await WaitUntilAsync(
-            () => rolloutSource.ObservedChangeCount >= 1,
+            () => rolloutSource.ChangeCount >= 5,
             TimeSpan.FromSeconds(5));
         await Task.Delay(TimeSpan.FromSeconds(2));
 
+        AssertTrue(rolloutFactory.CreateCount == 0, "Connected App Server unnecessarily created a rollout source.");
+        AssertTrue(rolloutSource.RefreshCount == 0, "Connected App Server read rollout history.");
+        AssertTrue(rolloutSource.ObservedChangeCount == 0, "Connected App Server watched rollout changes.");
         var rolloutChangeCount = rolloutSource.ChangeCount;
         var appServerReadCount = factory.Session.ReadRateLimitsCallCount;
         var maxConcurrentReads = factory.Session.MaxConcurrentReadRateLimits;
@@ -1945,6 +1954,61 @@ static async Task McpHelperPeriodicResyncSurvivesContinuousRolloutChanges()
     finally
     {
         DeleteRuntimeDirectory(runtimePaths);
+    }
+}
+
+static async Task McpHelperActivatesFallbackAfterAppServerFailure()
+{
+    using var fixture = new RolloutFixture();
+    fixture.WriteRollout("session-fallback", [fixture.TokenCount(58m, 10080, 1_788_020_771L, null)]);
+    var runtimePaths = new HelperRuntimePaths(Path.Combine(fixture.Root, "helper"));
+    using var helperCancellation = new CancellationTokenSource();
+    var appServerFactory = new TestAppServerSessionFactory();
+    using var rolloutSource = new RolloutQuotaSource(fixture.Profile);
+    var rolloutFactory = new TestRolloutQuotaSourceFactory(rolloutSource);
+    var titleUpdater = new TestAutomaticTitleUpdateService();
+    var settingsFactory = new CodexQuotaTitleSettingsStoreFactory(
+        new LocalAppDataSettingsPathResolver(Path.Combine(runtimePaths.DirectoryPath, "settings")));
+    var service = new McpHelperService(
+        new NeverExitingTestHostProcessLifetime(),
+        new TestHostWindowProvider(),
+        settingsFactory,
+        new TestSettingsChangeWatcherFactory(),
+        titleUpdater,
+        refreshInterval: TimeSpan.FromMilliseconds(40),
+        rolloutQuotaSourceFactory: rolloutFactory,
+        appServerSessionFactory: appServerFactory);
+    var run = service.RunAsync(
+        new McpHelperStartupRequest(fixture.Profile.RawCodexHome!, fixture.Profile, 333, 222, "mcp", runtimePaths),
+        helperCancellation.Token);
+    try
+    {
+        await WaitUntilAsync(() => appServerFactory.Session.ReadRateLimitsCallCount >= 2, TimeSpan.FromSeconds(5));
+        AssertTrue(rolloutFactory.CreateCount == 0, "Startup or periodic App Server refresh scanned rollouts.");
+        AssertTrue(rolloutSource.ProfileBytesRead == 0, "Rollout contents were read while App Server was connected.");
+
+        var titlesBeforeFailure = titleUpdater.Requests.Count;
+        appServerFactory.Session.FailRateLimitsReads = true;
+        await WaitUntilAsync(
+            () => rolloutFactory.CreateCount == 1 && rolloutSource.ProfileBytesRead > 0 &&
+                  titleUpdater.Requests.Count > titlesBeforeFailure,
+            TimeSpan.FromSeconds(5));
+        var retainedQuotas = titleUpdater.Requests.Last().Quotas;
+        AssertTrue(retainedQuotas.RateLimits?.Secondary?.UsedPercent == 12m, "Stale history replaced a newer App Server snapshot.");
+
+        File.AppendAllText(fixture.RolloutPath,
+            fixture.TokenCount(64m, 10080, 1_788_020_772L, null, DateTimeOffset.UtcNow.AddSeconds(1).ToString("O")) + Environment.NewLine);
+        await WaitUntilAsync(
+            () => titleUpdater.Requests.LastOrDefault()?.Quotas.RateLimits?.Primary?.UsedPercent == 64m,
+            TimeSpan.FromSeconds(5));
+        AssertTrue(rolloutFactory.CreateCount == 1, "Periodic fallback recreated the rollout source and lost its cache.");
+    }
+    finally
+    {
+        helperCancellation.Cancel();
+        var result = await run.WaitAsync(TimeSpan.FromSeconds(5));
+        AssertEqual("rollout", result.FinalState!.QuotaSource);
+        AssertTrue(result.FinalState.Quotas.Single().Primary?.UsedPercent == 64m, "Fallback did not persist new quota data after connection loss.");
     }
 }
 
@@ -2763,7 +2827,13 @@ file sealed class TestRolloutQuotaSourceFactory : IRolloutQuotaSourceFactory
         _source = source;
     }
 
-    public IRolloutQuotaSource Create(ProfileIdentity profile) => _source;
+    public int CreateCount { get; private set; }
+
+    public IRolloutQuotaSource Create(ProfileIdentity profile)
+    {
+        CreateCount++;
+        return _source;
+    }
 }
 
 file sealed class TestRolloutQuotaSource : IRolloutQuotaSource
@@ -2775,7 +2845,15 @@ file sealed class TestRolloutQuotaSource : IRolloutQuotaSource
         _result = result;
     }
 
-    public RolloutQuotaReadResult Refresh() => _result;
+    private int _refreshCount;
+
+    public int RefreshCount => Volatile.Read(ref _refreshCount);
+
+    public RolloutQuotaReadResult Refresh()
+    {
+        Interlocked.Increment(ref _refreshCount);
+        return _result;
+    }
 
     public Task WaitForChangeAsync(CancellationToken cancellationToken) => Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
 
@@ -2807,7 +2885,15 @@ file sealed class ContinuouslyChangingTestRolloutQuotaSource : IRolloutQuotaSour
 
     public int ObservedChangeCount => Volatile.Read(ref _observedChangeCount);
 
-    public RolloutQuotaReadResult Refresh() => _result;
+    private int _refreshCount;
+
+    public int RefreshCount => Volatile.Read(ref _refreshCount);
+
+    public RolloutQuotaReadResult Refresh()
+    {
+        Interlocked.Increment(ref _refreshCount);
+        return _result;
+    }
 
     public async Task WaitForChangeAsync(CancellationToken cancellationToken)
     {
@@ -3055,6 +3141,7 @@ file sealed class TestAppServerSession : IHelperAppServerSession
     private int _disposeCallCount;
     private int _maxConcurrentReadRateLimits;
     private int _readRateLimitsCallCount;
+    private bool _failRateLimitsReads;
 
     public TestAppServerSession(TimeSpan? readDelay = null)
     {
@@ -3069,6 +3156,12 @@ file sealed class TestAppServerSession : IHelperAppServerSession
 
     public int ReadRateLimitsCallCount => Volatile.Read(ref _readRateLimitsCallCount);
 
+    public bool FailRateLimitsReads
+    {
+        get => Volatile.Read(ref _failRateLimitsReads);
+        set => Volatile.Write(ref _failRateLimitsReads, value);
+    }
+
     public Task<CodexAccountSummary> ReadAccountAsync(CancellationToken cancellationToken) =>
         Task.FromResult(new CodexAccountSummary("chatgpt", "not-for-diagnostics@example.test", "pro", false));
 
@@ -3079,6 +3172,11 @@ file sealed class TestAppServerSession : IHelperAppServerSession
         UpdateMaxConcurrentReads(activeReads);
         try
         {
+            if (FailRateLimitsReads)
+            {
+                throw new CodexAppServerException("The App Server connection was lost.");
+            }
+
             if (_readDelay > TimeSpan.Zero)
             {
                 await Task.Delay(_readDelay, cancellationToken);
@@ -3124,11 +3222,26 @@ file sealed class TestAppServerSession : IHelperAppServerSession
 
 file sealed class TestAutomaticTitleUpdateService : IAutomaticTitleUpdateService
 {
-    public List<AutomaticTitleUpdateRequest> Requests { get; } = [];
+    private readonly List<AutomaticTitleUpdateRequest> _requests = [];
+    private readonly object _sync = new();
+
+    public IReadOnlyList<AutomaticTitleUpdateRequest> Requests
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _requests.ToArray();
+            }
+        }
+    }
 
     public AutomaticTitleUpdateResult Apply(AutomaticTitleUpdateRequest request)
     {
-        Requests.Add(request);
+        lock (_sync)
+        {
+            _requests.Add(request);
+        }
         return new AutomaticTitleUpdateResult(true, false, false, false, request.ExpectedCorrelation, 1, null, null);
     }
 }
