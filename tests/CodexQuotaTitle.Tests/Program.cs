@@ -77,6 +77,7 @@ var tests = new (string Name, Action Execute)[]
     ("MCP does not start a helper when the implicit CODEX_HOME is absent", McpStartupContextDoesNotStartHelperWhenImplicitHomeIsAbsent),
     ("MCP package configuration forwards CODEX_HOME with relative paths", McpPackageConfigurationForwardsCodexHomeRelatively),
     ("MCP starts one helper per profile and forwards host hints", McpBootstrapperStartsOneHelperPerProfile),
+    ("MCP selects the desktop root above Chromium utility processes", McpBootstrapperUsesDesktopRootAboveUtilityProcesses),
     ("Concurrent MCP bootstraps start one helper for one profile", () => McpBootstrapperSerializesConcurrentStarts().GetAwaiter().GetResult()),
     ("MCP replaces a stale dead helper runtime state", McpBootstrapperReplacesStaleState),
     ("MCP replaces a stale inaccessible helper runtime state", McpBootstrapperReplacesInaccessibleStaleState),
@@ -1046,7 +1047,22 @@ static void McpPackageConfigurationForwardsCodexHomeRelatively()
     AssertTrue(environmentVariables.Length == 1 && string.Equals(environmentVariables[0], "CODEX_HOME", StringComparison.Ordinal), "The MCP configuration does not forward only CODEX_HOME.");
 }
 
-static void McpBootstrapperStartsOneHelperPerProfile()
+static void McpBootstrapperStartsOneHelperPerProfile() =>
+    VerifyMcpBootstrapperStartsOneHelperPerProfile(CreateDesktopProcessTree());
+
+static void McpBootstrapperUsesDesktopRootAboveUtilityProcesses() =>
+    VerifyMcpBootstrapperStartsOneHelperPerProfile(new McpProcessTree(
+        222,
+        [
+            new McpProcessNode(111, "CodexQuotaTitle.Mcp.exe"),
+            new McpProcessNode(222, "CODEX.EXE"),
+            new McpProcessNode(444, "ChatGPT.exe"),
+            new McpProcessNode(445, "chatgpt.exe"),
+            new McpProcessNode(333, "ChatGPT.exe"),
+            new McpProcessNode(555, "explorer.exe"),
+        ]));
+
+static void VerifyMcpBootstrapperStartsOneHelperPerProfile(McpProcessTree processTree)
 {
     var profile = ProfileIdentity.Create(Path.Combine(Path.GetTempPath(), "cqt-mcp-bootstrap-tests", Guid.NewGuid().ToString("N")));
     var runtimePaths = HelperRuntimePaths.ForProfile(profile.ProfileHash);
@@ -1054,7 +1070,6 @@ static void McpBootstrapperStartsOneHelperPerProfile()
     {
         var liveness = new TestProcessLiveness();
         var starter = new TestHelperProcessStarter(liveness);
-        var processTree = CreateDesktopProcessTree();
         var first = new McpHelperBootstrapper(
             new McpBootstrapLog(runtimePaths.DirectoryPath),
             new McpStartupContext(profile.RawCodexHome, profile),

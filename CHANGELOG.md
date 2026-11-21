@@ -4,6 +4,10 @@ All notable changes to CodexQuotaTitle are documented in this file.
 
 ## Unreleased
 
+## [0.1.12] - 2026-11-21
+
+- Resolve the main Codex Desktop process above Chromium utility ancestors so the helper can correlate and update its window title.
+
 ## [0.1.11] - 2026-10-10
 
 - Start rollout readers and watchers only when App Server is unavailable, avoiding session-history scans while live quotas work.

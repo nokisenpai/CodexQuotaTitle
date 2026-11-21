@@ -100,7 +100,7 @@ public sealed class McpHelperBootstrapper
             return new McpHelperBootstrapResult(false, null, "profile-identity-unavailable");
         }
 
-        var hostChatGptPid = _processTree.FindProcessId("ChatGPT.exe");
+        var hostChatGptPid = _processTree.FindOutermostProcessId("ChatGPT.exe");
         if (hostChatGptPid is not > 0)
         {
             _bootstrapLog.TryAppend("MCP_HELPER_NOT_STARTED_HOST_CHATGPT_PID_UNAVAILABLE");

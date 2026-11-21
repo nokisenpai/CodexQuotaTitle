@@ -13,6 +13,9 @@ public sealed record McpProcessTree(int? ParentProcessId, IReadOnlyList<McpProce
     public int? FindProcessId(string processName) =>
         Nodes.FirstOrDefault(node => string.Equals(node.ProcessName, processName, StringComparison.OrdinalIgnoreCase))?.ProcessId;
 
+    public int? FindOutermostProcessId(string processName) =>
+        Nodes.LastOrDefault(node => string.Equals(node.ProcessName, processName, StringComparison.OrdinalIgnoreCase))?.ProcessId;
+
     public static McpProcessTree Capture(int processId)
     {
         var inspectedProcesses = new ProcessInspectionService().GetProcessChain(processId, maximumDepth: 64);
